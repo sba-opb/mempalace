@@ -8,6 +8,9 @@
 
 > [!IMPORTANT]
 > **🚨 Claude Code sessions expire in 30 days w/out auto-save hooks wired!** **[Read this →](https://github.com/MemPalace/mempalace/discussions/1388)**
+>
+> Need the shortest recovery/setup path? Use the
+> [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html).
 
 
 <div align="center">
@@ -157,6 +160,11 @@ system prompt:
 
 Two Claude Code hooks save periodically and before context compression:
 [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
+
+If you are installing under time pressure, start with the
+[Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html):
+wire the hooks, back up existing JSONL transcripts, and backfill them with
+`mempalace mine ~/.claude/projects/ --mode convos`.
 
 For per-message recall on top of the file-level chunks the hooks produce,
 run `mempalace sweep <transcript-dir>` periodically — it stores one
