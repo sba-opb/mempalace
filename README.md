@@ -168,7 +168,7 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 
 - Python 3.9+
 - A vector-store backend (ChromaDB by default)
-- ~300 MB disk for the default embedding model
+- ~300 MB disk for the default English-only embedding model. For multilingual recall (100+ languages, including non-Latin scripts), install with `pip install mempalace[multilingual]` and set `MEMPALACE_EMBEDDING_MODEL=embeddinggemma` — see the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
 
 No API key is required for the core benchmark path.
 
