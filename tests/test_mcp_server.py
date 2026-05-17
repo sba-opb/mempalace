@@ -769,6 +769,129 @@ class TestReadTools:
         assert "error" in result
 
 
+# ── Regression: None-metadata safety (issue #1426) ──────────────────────
+
+
+class TestNoneMetadataSafety:
+    """Regression coverage for issue #1426.
+
+    ChromaDB's ``col.get()`` / ``col.query()`` can return ``None`` for the
+    metadata cell of a partially-flushed row or any row written without
+    metadata in older formats. Before the ``_safe_meta`` boundary helper,
+    indexing the result yielded ``None``, the next ``.get(...)`` raised
+    ``AttributeError: 'NoneType' object has no attribute 'get'``, and the
+    handler crashed before the ``DELETE FROM embeddings_queue`` cleanup
+    step — so the queue grew without bound while writes kept appearing
+    successful.
+
+    Each test simulates Chroma returning ``None`` in the metadatas list
+    via a stub collection — Chroma's own write path rejects ``None`` at
+    insert time, so we can't reproduce the upstream state by writing
+    bad data through the real backend. Mocking ``_get_collection`` lets
+    us assert the handler tolerates the failure mode that actually shows
+    up in the wild.
+    """
+
+    def test_safe_meta_helper_coerces_none_to_empty_dict(self):
+        from mempalace.mcp_server import _safe_meta
+
+        assert _safe_meta(None) == {}
+        assert _safe_meta({}) == {}
+        assert _safe_meta({"wing": "x"}) == {"wing": "x"}
+        # Defensive against other non-dict types Chroma might return on
+        # malformed rows — coerce, don't crash.
+        assert _safe_meta("not a dict") == {}
+        assert _safe_meta(["wing", "x"]) == {}
+
+    def test_get_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_none_meta"],
+            "documents": ["verbatim body"],
+            "metadatas": [None],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_get_drawer("drawer_none_meta")
+        assert "error" not in result
+        assert result["drawer_id"] == "drawer_none_meta"
+        # Missing metadata reduces to empty defaults — no crash, no leak.
+        assert result["wing"] == ""
+        assert result["room"] == ""
+        assert result["content"] == "verbatim body"
+
+    def test_list_drawers_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_a", "drawer_b"],
+            "documents": ["body a", "body b"],
+            "metadatas": [None, {"wing": "ok", "room": "fine"}],
+        }
+        stub_col.count.return_value = 2
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_list_drawers()
+        assert result["count"] == 2
+        assert result["drawers"][0]["wing"] == ""
+        assert result["drawers"][0]["room"] == ""
+        assert result["drawers"][1]["wing"] == "ok"
+        assert result["drawers"][1]["room"] == "fine"
+
+    def test_update_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_none_meta"],
+            "documents": ["old body"],
+            "metadatas": [None],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_update_drawer("drawer_none_meta", wing="recovered")
+        # Should succeed: old_meta is coerced to {}, new wing slots in cleanly.
+        assert result.get("success") is True
+        # Confirm the update call carried the new wing without inheriting None.
+        update_call = stub_col.update.call_args
+        assert update_call is not None
+        new_meta = update_call.kwargs["metadatas"][0]
+        assert new_meta["wing"] == "recovered"
+
+    def test_delete_drawer_audit_log_tolerates_none_metadata(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_none_meta"],
+            "documents": ["doomed body"],
+            "metadatas": [None],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        # Should reach the delete call without AttributeError on the audit-log path.
+        result = mcp_server.tool_delete_drawer("drawer_none_meta")
+        assert result["success"] is True
+        stub_col.delete.assert_called_once_with(ids=["drawer_none_meta"])
+
+
 # ── Search Tool ─────────────────────────────────────────────────────────
 
 

@@ -568,6 +568,28 @@ def _no_palace():
 # ==================== HELPERS ====================
 
 
+def _safe_meta(meta):
+    """Coerce a Chroma metadata value to a dict.
+
+    ChromaDB's ``col.get()`` / ``col.query()`` can return ``None`` for the
+    metadata cell of a partially-flushed row (or any row written without
+    metadata in older formats). Indexing the result then yields ``None``,
+    and downstream ``.get(...)`` calls raise::
+
+        AttributeError: 'NoneType' object has no attribute 'get'
+
+    This bug bricked the embeddings_queue cleanup path in issue #1426 —
+    the handler crashed before reaching the ``DELETE FROM embeddings_queue``
+    step, so the queue grew without bound while writes kept appearing
+    successful.
+
+    Centralizing the coercion through this helper makes the contract
+    explicit and keeps the fix self-documenting at every call site:
+    *metadata is always a dict by the time it leaves the boundary*.
+    """
+    return meta if isinstance(meta, dict) else {}
+
+
 def _fetch_all_metadata(col, where=None):
     """Paginate col.get() to avoid the 10K silent truncation limit."""
     total = col.count()
@@ -934,7 +956,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                 if similarity >= threshold:
                     # Chroma 1.5.x can return None for partially-flushed rows;
                     # coerce to empty sentinels so downstream .get() is safe.
-                    meta = results["metadatas"][0][i] or {}
+                    meta = _safe_meta(results["metadatas"][0][i])
                     doc = results["documents"][0][i] or ""
                     duplicates.append(
                         {
@@ -1132,7 +1154,9 @@ def tool_delete_drawer(drawer_id: str):
 
     # Log the deletion with the content being removed for audit trail
     deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+    deleted_meta = _safe_meta(
+        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+    )
     _wal_log(
         "delete_drawer",
         {
@@ -1194,7 +1218,7 @@ def tool_get_drawer(drawer_id: str):
         result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
         if not result["ids"]:
             return {"error": f"Drawer not found: {drawer_id}"}
-        meta = result["metadatas"][0]
+        meta = _safe_meta(result["metadatas"][0])
         doc = result["documents"][0]
         # source_file is the absolute filesystem path written by the
         # miners. Reduce to its basename before handing it to the MCP
@@ -1254,7 +1278,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
         drawers = []
         for i, did in enumerate(result["ids"]):
-            meta = result["metadatas"][i]
+            meta = _safe_meta(result["metadatas"][i])
             doc = result["documents"][i]
             drawers.append(
                 {
@@ -1290,7 +1314,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         if not existing["ids"]:
             return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-        old_meta = existing["metadatas"][0]
+        old_meta = _safe_meta(existing["metadatas"][0])
         old_doc = existing["documents"][0]
 
         new_doc = old_doc
@@ -1600,6 +1624,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         # Combine and sort by timestamp
         entries = []
         for doc, meta in zip(results["documents"], results["metadatas"]):
+            meta = _safe_meta(meta)
             entries.append(
                 {
                     "date": meta.get("date", ""),
