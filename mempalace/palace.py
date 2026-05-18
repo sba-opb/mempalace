@@ -454,7 +454,10 @@ def _read_lock_holder(lock_file) -> str:
     """Read the prior holder's identity from the lock-file body, best-effort."""
     try:
         lock_file.seek(_LOCK_SENTINEL_BYTES)
-        content = lock_file.read().strip()
+        content = lock_file.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        content = content.strip()
     except OSError:
         return "another writer (identity not recorded)"
     if not content:
@@ -471,11 +474,12 @@ def _write_lock_holder(lock_file) -> None:
     """
     try:
         ident = f"{os.getpid()} {' '.join(sys.argv[:3])}".strip()
+        ident_bytes = ident.encode("utf-8")
         lock_file.seek(_LOCK_SENTINEL_BYTES)
-        lock_file.truncate(_LOCK_SENTINEL_BYTES + len(ident.encode("utf-8")))
-        lock_file.write(ident)
+        lock_file.truncate(_LOCK_SENTINEL_BYTES + len(ident_bytes))
+        lock_file.write(ident_bytes)
         lock_file.flush()
-    except OSError:
+    except (OSError, UnicodeError):
         pass
 
 
@@ -537,7 +541,7 @@ def mine_palace_lock(palace_path: str):
             os.close(fd)
         except FileExistsError:
             pass
-    lf = open(lock_path, "r+")
+    lf = open(lock_path, "r+b")
     acquired = False
     try:
         # Lock byte 0 explicitly. msvcrt.locking is byte-position dependent;
