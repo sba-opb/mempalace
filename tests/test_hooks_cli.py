@@ -85,30 +85,36 @@ def test_mempalace_python_handles_shallow_path_without_crashing(monkeypatch):
     """Regression: _mempalace_python must not raise IndexError when the
     package lives at a shallow filesystem path.
 
-    The function indexes ``Path(__file__).resolve().parents[3]`` to find the
-    venv root in a standard ``<venv>/lib/python3.X/site-packages/mempalace/``
-    install. In editable installs at a shallow path (Docker containers
-    mounting at ``/work``, ``/opt/app``, etc.), ``parents`` has fewer than
-    4 elements and the index raises ``IndexError``. Affected sites where
-    this surfaces: Docker-based dev, OrbStack-style cross-platform CI,
+    The function used to index ``Path(__file__).resolve().parents[3]`` to
+    find the venv root for the standard ``<venv>/lib/python3.X/site-packages/
+    mempalace/`` install. In editable installs at a shallow path (Docker
+    containers mounting at ``/work``, ``/opt/app``, etc.), ``parents`` has
+    fewer than 4 elements and the bare index would raise ``IndexError``.
+    Affected sites: Docker-based dev, OrbStack-style cross-platform CI,
     minimal-prefix production installs.
 
-    The fix guards the ``parents[3]`` access so the function falls through
-    to the editable-install case (parents[1]) and ultimately to
-    sys.executable, instead of crashing.
+    The fix uses ``len(parents)`` LBYL checks so the function falls through
+    to the editable-install branch (``parents[1]``) and ultimately to
+    ``sys.executable``, instead of crashing.
     """
+    from pathlib import Path as RealPath
     from unittest.mock import MagicMock, patch
 
-    from pathlib import Path as RealPath
+    # Build a fake parents sequence with only 3 elements (indices 0, 1, 2);
+    # ``parents[3]`` would raise IndexError if accessed. Production code
+    # uses ``len(parents) > 3`` LBYL guard to skip that branch, so the
+    # IndexError should never actually fire — but ``side_effect`` keeps it
+    # defensive against a future regression that drops the length check.
+    def get_item(idx):
+        if idx == 1:
+            return RealPath("/work/mempalace")
+        raise IndexError(idx)
 
-    # Build a fake Path whose .resolve().parents has only 3 elements
-    # (indexes 0, 1, 2 — so [3] would raise IndexError).
-    fake_path = MagicMock()
-    # parents[1] still works (editable-install branch)
     fake_parents = MagicMock()
-    fake_parents.__getitem__ = lambda self, idx: (
-        RealPath("/work/mempalace") if idx == 1 else (_ for _ in ()).throw(IndexError(idx))
-    )
+    fake_parents.__len__.return_value = 3
+    fake_parents.__getitem__.side_effect = get_item
+
+    fake_path = MagicMock()
     fake_path.resolve.return_value.parents = fake_parents
 
     with patch("mempalace.hooks_cli.Path", return_value=fake_path):
