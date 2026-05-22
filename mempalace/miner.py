@@ -475,7 +475,13 @@ def chunk_text(
     """
     Split content into drawer-sized chunks.
     Tries to split on paragraph/line boundaries.
-    Returns list of {"content": str, "chunk_index": int}
+    Returns list of {"content": str, "chunk_index": int, "line_start": int, "line_end": int}
+
+    ``line_start`` / ``line_end`` are 1-indexed line numbers in the stripped
+    source, giving an approximate locator for where the chunk came from.
+    Closet pointers (Tier 6a) use this to emit ``YYYY-MM-DD:L42-L78`` segments
+    so retrieval can jump straight to the right span without opening the
+    whole drawer.
 
     Optional params override module-level defaults when provided.
     """
@@ -531,10 +537,17 @@ def chunk_text(
 
         chunk = content[start:end].strip()
         if len(chunk) >= min_chunk_size:
+            # Tier 6a — 1-indexed line range in the stripped source.
+            # Approximate locator (±1 at boundaries is fine for "jump to
+            # roughly here"); exact-quote positioning is a future tier.
+            line_start = content[:start].count("\n") + 1
+            line_end = content[:end].count("\n") + 1
             chunks.append(
                 {
                     "content": chunk,
                     "chunk_index": chunk_index,
+                    "line_start": line_start,
+                    "line_end": line_end,
                 }
             )
             chunk_index += 1
@@ -867,6 +880,231 @@ def _extract_entities_for_metadata(content: str) -> str:
     return ";".join(capped)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 6a content-date extraction
+#
+# Hierarchy (first match wins):
+#   1. Filename — ISO regex on stem, then dateutil fuzzy parse for natural-
+#      language formats (handles "April-6th-2011-notes", "Nov-8-2024", etc.)
+#   2. YAML frontmatter — date / created / published field
+#   3. Content body, first ~10 lines:
+#        a. ISO regex (YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD)
+#        b. Slash dates with locale auto-disambiguation
+#           (if any day > 12 appears in the file, lock locale to DD/MM)
+#        c. dateutil fuzzy parse for natural-language ("November 8, 2024",
+#           "April 6th 2011", "8 Nov 2024", etc.)
+#   4. Filesystem mtime (os.path.getmtime)
+#   5. None — caller falls back to filed_at
+#
+# The "approximate locator" philosophy applies: this is a metadata enrichment
+# that makes closet pointers honest for content with embedded dates, NOT a
+# bulletproof timeline-reconstruction tool. Files with no date markers
+# anywhere and no filesystem mtime return None (caller uses filed_at).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_ORDINAL_SUFFIX_RE = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+_ISO_DATE_RE = re.compile(r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b")
+_SLASH_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+
+
+def _try_iso_match(text: str) -> Optional[str]:
+    """Try to extract YYYY-MM-DD from text via the ISO regex. Returns ISO string or None."""
+    m = _ISO_DATE_RE.search(text)
+    if not m:
+        return None
+    try:
+        from datetime import date
+
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def _try_filename_date(source_file: str) -> Optional[str]:
+    """Extract date from filename stem. ISO regex first, then dateutil fuzzy."""
+    try:
+        stem = Path(source_file).stem
+    except (TypeError, ValueError):
+        return None
+    if not stem:
+        return None
+
+    # ISO direct: "2024-11-08", "2024-11-08-notes", etc.
+    iso = _try_iso_match(stem)
+    if iso:
+        return iso
+
+    # Natural language: "April-6th-2011-notes", "Nov-8-2024", etc.
+    # Preprocess: strip ordinals, dashes/underscores → spaces.
+    normalized = _ORDINAL_SUFFIX_RE.sub(r"\1", stem).replace("-", " ").replace("_", " ")
+    try:
+        from dateutil import parser as dateutil_parser
+
+        dt = dateutil_parser.parse(normalized, fuzzy=True)
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, ImportError):
+        return None
+    except Exception:
+        # dateutil can raise unexpected exceptions on weird input; treat as no match.
+        return None
+
+
+def _try_frontmatter_date(content: str) -> Optional[str]:
+    """Extract date from YAML frontmatter date / created / published field."""
+    if not content:
+        return None
+    stripped = content.lstrip()
+    if not stripped.startswith("---"):
+        return None
+
+    lines = stripped.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+
+    # Find closing ---
+    end_idx = None
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return None
+
+    frontmatter_text = "\n".join(lines[1:end_idx])
+    try:
+        import yaml
+
+        data = yaml.safe_load(frontmatter_text)
+    except (ImportError, Exception):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    for field in ("date", "created", "published"):
+        value = data.get(field)
+        if value is None:
+            continue
+        # yaml.safe_load may parse ISO dates as datetime.date/datetime objects directly.
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d")
+        # Otherwise parse via dateutil.
+        try:
+            from dateutil import parser as dateutil_parser
+
+            dt = dateutil_parser.parse(str(value))
+            return dt.strftime("%Y-%m-%d")
+        except (ValueError, OverflowError, ImportError):
+            continue
+        except Exception:
+            continue
+    return None
+
+
+def _try_content_body_date(content: str) -> Optional[str]:
+    """Scan first ~10 lines of content body for a date.
+
+    Order within the scan:
+      1. ISO regex (highest signal)
+      2. Slash dates with locale auto-disambiguation (DD/MM vs MM/DD)
+      3. dateutil fuzzy for natural-language ("November 8, 2024" etc.)
+    """
+    if not content:
+        return None
+
+    # Skip frontmatter if present.
+    stripped = content.lstrip()
+    if stripped.startswith("---"):
+        lines = stripped.split("\n")
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                stripped = "\n".join(lines[i + 1 :])
+                break
+
+    head = "\n".join(stripped.split("\n")[:10])
+    if not head:
+        return None
+
+    # 1. ISO regex — explicit, highest confidence.
+    iso = _try_iso_match(head)
+    if iso:
+        return iso
+
+    # 2. Slash dates with locale auto-disambiguation.
+    slash_matches = _SLASH_DATE_RE.findall(head)
+    if slash_matches:
+        # If any first-number > 12, the locale MUST be DD/MM (otherwise that
+        # number couldn't be a month). Lock it for ALL dates in this file.
+        is_dd_mm = any(int(m[0]) > 12 for m in slash_matches)
+        first = slash_matches[0]
+        a, b, y = int(first[0]), int(first[1]), int(first[2])
+        if y < 100:
+            # Two-digit year — stdlib convention: 70-99 → 19xx, 00-69 → 20xx.
+            y = 1900 + y if y >= 70 else 2000 + y
+        try:
+            from datetime import date
+
+            if is_dd_mm:
+                return date(y, b, a).isoformat()
+            return date(y, a, b).isoformat()
+        except (ValueError, TypeError):
+            pass  # Fall through to dateutil fuzzy.
+
+    # 3. dateutil fuzzy — natural-language fallback ("November 8, 2024" etc.).
+    try:
+        from dateutil import parser as dateutil_parser
+
+        dt = dateutil_parser.parse(head, fuzzy=True)
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, ImportError):
+        return None
+    except Exception:
+        return None
+
+
+def _try_mtime_date(source_file: str) -> Optional[str]:
+    """Filesystem mtime → ISO date."""
+    try:
+        mtime = os.path.getmtime(source_file)
+    except (OSError, TypeError):
+        return None
+    try:
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def _extract_content_date(source_file: str, content: str) -> Optional[str]:
+    """Extract a content date from source_file or content.
+
+    Returns ISO 'YYYY-MM-DD' string, or None if no date can be determined.
+    See module-level comment block for the full hierarchy + design rationale.
+    """
+    # 1. Filename
+    result = _try_filename_date(source_file)
+    if result:
+        return result
+
+    # 2. YAML frontmatter
+    result = _try_frontmatter_date(content)
+    if result:
+        return result
+
+    # 3. Content body
+    result = _try_content_body_date(content)
+    if result:
+        return result
+
+    # 4. Filesystem mtime
+    result = _try_mtime_date(source_file)
+    if result:
+        return result
+
+    # 5. Nothing found — caller falls back to filed_at.
+    return None
+
+
 def _build_drawer_metadata(
     wing: str,
     room: str,
@@ -875,12 +1113,24 @@ def _build_drawer_metadata(
     agent: str,
     content: str,
     source_mtime: Optional[float],
+    line_start: Optional[int] = None,
+    line_end: Optional[int] = None,
+    content_date: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
     Split out from ``add_drawer`` so ``process_file`` can batch all chunks
     of a file into a single ``collection.upsert`` — one embedding forward
     pass per batch instead of per chunk.
+
+    Tier 6a — ``line_start`` / ``line_end`` are optional 1-indexed line
+    numbers in the source file. ``content_date`` is the optional ISO date
+    extracted from filename / frontmatter / content body / mtime. When
+    passed, they're stored in metadata so closet pointers can carry
+    "where in the source" + "when the content is from" info. When omitted
+    (legacy callers, pre-Tier-6a drawers), the keys are absent from the
+    returned dict and downstream code falls back to ``filed_at`` for the
+    date and the 3-segment closet pointer format.
     """
     metadata = {
         "wing": wing,
@@ -893,6 +1143,12 @@ def _build_drawer_metadata(
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
+    if line_start is not None:
+        metadata["line_start"] = line_start
+    if line_end is not None:
+        metadata["line_end"] = line_end
+    if content_date:
+        metadata["content_date"] = content_date
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1024,6 +1280,12 @@ def process_file(
         except OSError:
             source_mtime = None
 
+        # Tier 6a content-date: extract once per file (not per chunk) and
+        # share across all chunks. Reads filename / frontmatter / content /
+        # mtime hierarchy. Returns None when nothing usable found → caller
+        # falls back to filed_at downstream.
+        file_content_date = _extract_content_date(source_file, content)
+
         drawers_added = 0
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
@@ -1042,6 +1304,9 @@ def process_file(
                         agent,
                         chunk["content"],
                         source_mtime,
+                        line_start=chunk.get("line_start"),
+                        line_end=chunk.get("line_end"),
+                        content_date=file_content_date,
                     )
                 )
             collection.upsert(

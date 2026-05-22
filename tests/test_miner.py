@@ -99,14 +99,14 @@ def test_mine_computes_hallways_for_wing_post_mine(monkeypatch):
         # Must have been called exactly once, with our wing name + a live
         # collection. We don't pin min_count — the integration may pick a
         # default that differs from the function's own default.
-        assert len(hallway_calls) == 1, (
-            f"expected compute_hallways_for_wing to be called once, got {len(hallway_calls)}"
-        )
+        assert (
+            len(hallway_calls) == 1
+        ), f"expected compute_hallways_for_wing to be called once, got {len(hallway_calls)}"
         call = hallway_calls[0]
         assert call["wing"] == "test_project"
-        assert call["col"] is not None, (
-            "must pass the live collection so hallways can query drawers"
-        )
+        assert (
+            call["col"] is not None
+        ), "must pass the live collection so hallways can query drawers"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -553,12 +553,12 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     # Lowercase mentions of seeded names must still be tagged.
     result = miner._extract_entities_for_metadata("aya talked to lumi today about the palace.")
     matched = set(result.split(";")) if result else set()
-    assert "Aya" in matched, (
-        f"lowercase 'aya' must match the seeded 'Aya' (case-insensitive). Got: {matched!r}"
-    )
-    assert "Lumi" in matched, (
-        f"lowercase 'lumi' must match the seeded 'Lumi' (case-insensitive). Got: {matched!r}"
-    )
+    assert (
+        "Aya" in matched
+    ), f"lowercase 'aya' must match the seeded 'Aya' (case-insensitive). Got: {matched!r}"
+    assert (
+        "Lumi" in matched
+    ), f"lowercase 'lumi' must match the seeded 'Lumi' (case-insensitive). Got: {matched!r}"
 
     # Mixed case must also match
     result_mixed = miner._extract_entities_for_metadata("Aya saw lumi. AYA waved.")
@@ -1618,3 +1618,255 @@ def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
 
     assert pid_file.exists(), "Foreign PID entries must not be removed"
     assert pid_file.read_text().strip() == str(other_pid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 6a — chunk_text line-range emission + _build_drawer_metadata line keys
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestChunkTextLineRanges:
+    """Tier 6a — chunk_text emits 1-indexed (line_start, line_end) per chunk.
+
+    Closet pointer lines need to carry "where in the source file" info so
+    retrieval can jump straight to the relevant span instead of opening the
+    whole drawer. Line ranges live on the chunk dict, get plumbed through
+    ``_build_drawer_metadata`` into drawer metadata, then read by
+    ``build_closet_lines`` to emit ``YYYY-MM-DD:Lstart-Lend`` segments.
+    """
+
+    def test_each_chunk_carries_line_range(self):
+        from mempalace.miner import chunk_text
+
+        content = "\n".join(f"line {i}" for i in range(1, 401))  # 400 lines
+        chunks = chunk_text(content, "/x.md", chunk_size=800, chunk_overlap=80)
+        assert chunks, "should produce at least one chunk for a 400-line file"
+        for c in chunks:
+            assert "line_start" in c, f"chunk missing line_start: {c.keys()}"
+            assert "line_end" in c, f"chunk missing line_end: {c.keys()}"
+            assert isinstance(c["line_start"], int) and c["line_start"] >= 1
+            assert isinstance(c["line_end"], int) and c["line_end"] >= c["line_start"]
+
+    def test_first_chunk_starts_at_line_1(self):
+        from mempalace.miner import chunk_text
+
+        content = "\n".join(f"line {i}" for i in range(1, 200))
+        chunks = chunk_text(content, "/x.md", chunk_size=600, chunk_overlap=60)
+        assert chunks[0]["line_start"] == 1
+
+    def test_last_chunk_end_covers_final_line(self):
+        from mempalace.miner import chunk_text
+
+        total_lines = 300
+        content = "\n".join(f"line {i}" for i in range(1, total_lines + 1))
+        chunks = chunk_text(content, "/x.md", chunk_size=500, chunk_overlap=50)
+        # Last chunk's line_end must reach the final line of the source.
+        assert (
+            chunks[-1]["line_end"] >= total_lines
+        ), f"last chunk ends at L{chunks[-1]['line_end']}, expected >= L{total_lines}"
+
+    def test_single_chunk_spans_all_lines_for_small_input(self):
+        from mempalace.miner import chunk_text
+
+        content = "alpha\nbeta\ngamma\ndelta\nepsilon"  # 5 lines, well under chunk_size
+        chunks = chunk_text(content, "/x.md", chunk_size=2000, chunk_overlap=100, min_chunk_size=5)
+        assert len(chunks) == 1
+        assert chunks[0]["line_start"] == 1
+        assert chunks[0]["line_end"] == 5
+
+
+class TestBuildDrawerMetadataLineRange:
+    """Tier 6a — _build_drawer_metadata stores optional line_start / line_end.
+
+    When chunk metadata carries line range info, the drawer record carries it
+    too. When it doesn't (legacy callers, older miners), the function omits
+    the keys entirely — backward compatible.
+    """
+
+    def test_includes_line_range_when_provided(self):
+        from mempalace.miner import _build_drawer_metadata
+
+        meta = _build_drawer_metadata(
+            wing="wing_x",
+            room="room_y",
+            source_file="/file.md",
+            chunk_index=0,
+            agent="cedar",
+            content="some content here for entity scanning",
+            source_mtime=None,
+            line_start=42,
+            line_end=78,
+        )
+        assert meta.get("line_start") == 42
+        assert meta.get("line_end") == 78
+
+    def test_omits_line_range_when_not_provided(self):
+        from mempalace.miner import _build_drawer_metadata
+
+        meta = _build_drawer_metadata(
+            wing="wing_x",
+            room="room_y",
+            source_file="/file.md",
+            chunk_index=0,
+            agent="cedar",
+            content="some content",
+            source_mtime=None,
+        )
+        assert "line_start" not in meta
+        assert "line_end" not in meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 6a content-date extraction — hierarchy: filename → frontmatter →
+# content body → filesystem mtime → fallback to filed_at
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestExtractContentDate:
+    """Content-date extraction returns ISO 'YYYY-MM-DD' or None.
+
+    Priority order (first match wins):
+      1. Filename patterns (via dateutil fuzzy parse on the stem)
+      2. YAML frontmatter date / created / published field
+      3. Content body, first ~10 lines:
+         - ISO substrings, Claude preambles, natural-language dates
+         - Locale auto-disambiguation when slash-separated dates appear
+      4. Filesystem mtime
+      5. None (caller falls back to filed_at)
+    """
+
+    def test_filename_iso_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "2024-11-08.md"
+        f.write_text("body content with no date inside")
+        assert _extract_content_date(str(f), f.read_text()) == "2024-11-08"
+
+    def test_filename_natural_language_with_ordinal_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "April-6th-2011-notes.md"
+        f.write_text("body content")
+        assert _extract_content_date(str(f), f.read_text()) == "2011-04-06"
+
+    def test_filename_compact_dash_format_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "Nov-8-2024.md"
+        f.write_text("body content")
+        assert _extract_content_date(str(f), f.read_text()) == "2024-11-08"
+
+    def test_yaml_frontmatter_date_field_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = (
+            "---\n"
+            "title: Some Notes\n"
+            "date: 2024-11-08\n"
+            "tags: [diary]\n"
+            "---\n\n"
+            "Body content here.\n"
+        )
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_yaml_frontmatter_created_field_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "---\ncreated: 2023-07-15\n---\n\nbody\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2023-07-15"
+
+    def test_claude_session_preamble_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "transcript.md"
+        content = "Session resumed from compact on 2024-11-08\n" "User: hey lumi\n" "Lumi: hi aya\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_iso_date_in_first_line_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "# Notes from 2024-11-08\n\nWe talked about brands of dog food.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_natural_language_date_in_content_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "Notes from November 8, 2024 — what we talked about today.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_ambiguous_slash_date_locks_dd_mm_when_day_over_12_appears(self, tmp_path):
+        """04/11/22 + 25/03/21 in the same file → locale locks to DD/MM."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        # 25/03/21 cannot be MM/DD (no month 25) → file locale must be DD/MM
+        # Therefore 04/11/22 → 4 November 2022 → "2022-11-04"
+        content = "Started writing on 04/11/22.\n" "Earlier notes from 25/03/21 referenced.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2022-11-04"
+
+    def test_ambiguous_slash_date_defaults_to_mm_dd_without_disambiguator(self, tmp_path):
+        """04/11/22 with no day-over-12 disambiguator → default to US MM/DD/YY → 2022-04-11."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "Note from 04/11/22 about something.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2022-04-11"
+
+    def test_filename_wins_over_content_date(self, tmp_path):
+        """Priority: filename pattern fires before content scan."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "2020-01-01.md"
+        content = "but the content says 2024-11-08 inside\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2020-01-01"
+
+    def test_frontmatter_wins_over_content_body(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = (
+            "---\ndate: 2020-01-01\n---\n\n"
+            "Body talks about 2024-11-08 but frontmatter is older.\n"
+        )
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2020-01-01"
+
+    def test_mtime_fallback_when_no_dates_found(self, tmp_path):
+        """When filename / frontmatter / content all yield nothing, fall back to mtime."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        f.write_text("just a sentence with no date markers at all\n")
+        # Set mtime to a known value (2023-07-15 12:00 UTC)
+        import os
+
+        target = 1689422400.0  # 2023-07-15 12:00 UTC
+        os.utime(str(f), (target, target))
+        result = _extract_content_date(str(f), f.read_text())
+        assert result == "2023-07-15", f"expected mtime fallback, got {result!r}"
+
+    def test_returns_none_when_nothing_extractable_and_file_missing(self):
+        """Graceful when source_file path doesn't exist (e.g., test fixtures)."""
+        from mempalace.miner import _extract_content_date
+
+        # No filename pattern, no content dates, no real file → None
+        result = _extract_content_date("/nonexistent/untitled.md", "just plain text\n")
+        assert result is None
+
+    def test_returns_none_for_empty_content_and_missing_file(self):
+        from mempalace.miner import _extract_content_date
+
+        result = _extract_content_date("/nonexistent/untitled.md", "")
+        assert result is None
