@@ -2,13 +2,16 @@ import os
 import pickle
 import shutil
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import chromadb
 import pytest
 
 from mempalace.backends import (
+    CollectionNotInitializedError,
     GetResult,
+    PalaceNotFoundError,
     PalaceRef,
     QueryResult,
     UnsupportedFilterError,
@@ -452,37 +455,33 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
     """Simulate a ChromaDB 0.6.x database with BLOB seq_ids and verify repair."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    # Insert BLOB seq_id like ChromaDB 0.6.x would
-    blob_42 = (42).to_bytes(8, byteorder="big")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (blob_42,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        # Insert BLOB seq_id like ChromaDB 0.6.x would
+        blob_42 = (42).to_bytes(8, byteorder="big")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (blob_42,))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
-    assert row == (42, "integer")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
+        assert row == (42, "integer")
 
 
 def test_fix_blob_seq_ids_noop_without_blobs(tmp_path):
     """No error when seq_ids are already integers."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
-    assert row == (42, "integer")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
+        assert row == (42, "integer")
 
 
 def test_fix_blob_seq_ids_noop_without_database(tmp_path):
@@ -499,60 +498,56 @@ def test_fix_blob_seq_ids_does_not_touch_max_seq_id(tmp_path):
     silently suppressed every subsequent embeddings_queue write.
     """
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    conn.execute("CREATE TABLE max_seq_id (rowid INTEGER PRIMARY KEY, seq_id)")
-    sysdb10_blob = b"\x11\x11502607"
-    conn.execute("INSERT INTO max_seq_id (seq_id) VALUES (?)", (sysdb10_blob,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        conn.execute("CREATE TABLE max_seq_id (rowid INTEGER PRIMARY KEY, seq_id)")
+        sysdb10_blob = b"\x11\x11502607"
+        conn.execute("INSERT INTO max_seq_id (seq_id) VALUES (?)", (sysdb10_blob,))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM max_seq_id").fetchone()
-    assert row == (sysdb10_blob, "blob")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM max_seq_id").fetchone()
+        assert row == (sysdb10_blob, "blob")
 
 
 def test_fix_blob_seq_ids_skips_sysdb10_prefix_in_embeddings(tmp_path):
     """Defense-in-depth: sysdb-10 prefix in embeddings.seq_id is skipped."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    sysdb10_blob = b"\x11\x11502607"
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (sysdb10_blob,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        sysdb10_blob = b"\x11\x11502607"
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (sysdb10_blob,))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
-    # Still a BLOB — not converted to 1.23e18.
-    assert row == (sysdb10_blob, "blob")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
+        # Still a BLOB — not converted to 1.23e18.
+        assert row == (sysdb10_blob, "blob")
 
 
 def test_fix_blob_seq_ids_still_converts_legacy_blobs_in_embeddings(tmp_path):
     """Regression guard: pure big-endian u64 BLOBs still convert for genuine 0.6.x."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (b"\x11\x11502607",))
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((7).to_bytes(8, "big"),))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (b"\x11\x11502607",))
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((7).to_bytes(8, "big"),))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    rows = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings ORDER BY rowid").fetchall()
-    assert rows[0] == (42, "integer")
-    assert rows[1] == (b"\x11\x11502607", "blob")  # sysdb-10 row left alone
-    assert rows[2] == (7, "integer")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = conn.execute(
+            "SELECT seq_id, typeof(seq_id) FROM embeddings ORDER BY rowid"
+        ).fetchall()
+        assert rows[0] == (42, "integer")
+        assert rows[1] == (b"\x11\x11502607", "blob")  # sysdb-10 row left alone
+        assert rows[2] == (7, "integer")
 
 
 def test_fix_blob_seq_ids_writes_marker_after_blob_path(tmp_path):
@@ -560,11 +555,10 @@ def test_fix_blob_seq_ids_writes_marker_after_blob_path(tmp_path):
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
+        conn.commit()
 
     marker = tmp_path / _BLOB_FIX_MARKER
     assert not marker.exists()
@@ -585,11 +579,10 @@ def test_fix_blob_seq_ids_writes_marker_when_already_integer(tmp_path):
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
+        conn.commit()
 
     marker = tmp_path / _BLOB_FIX_MARKER
     assert not marker.exists()
@@ -830,9 +823,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [
-        palace_path
-    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    )
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -948,9 +941,9 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
     finally:
         backend.close()
 
-    assert (
-        calls == [palace_path]
-    ), "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    )
 
 
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
@@ -1002,6 +995,43 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
 
 
+def test_get_collection_raises_palace_not_found_when_dir_missing(tmp_path):
+    """create=False on a missing dir raises PalaceNotFoundError, not the
+    new CollectionNotInitializedError. The two states must be distinguishable
+    so callers can render state-specific messages (#1498)."""
+    missing = tmp_path / "no-such-dir"
+    with pytest.raises(PalaceNotFoundError) as excinfo:
+        ChromaBackend().get_collection(
+            str(missing),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Must be the parent class, not the new subclass: dir is genuinely absent.
+    assert not isinstance(excinfo.value, CollectionNotInitializedError)
+
+
+def test_get_collection_raises_collection_not_initialized_on_empty_palace(tmp_path):
+    """When the palace dir + DB exist but the collection has never been
+    created, ChromaBackend.get_collection(create=False) raises the new
+    CollectionNotInitializedError instead of leaking chromadb.NotFoundError
+    (#1498)."""
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    # PersistentClient lazily creates chroma.sqlite3 — no collection yet.
+    chromadb.PersistentClient(path=str(palace_path))
+    assert (palace_path / "chroma.sqlite3").is_file()
+
+    with pytest.raises(CollectionNotInitializedError) as excinfo:
+        ChromaBackend().get_collection(
+            str(palace_path),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Backward-compat: subclass of PalaceNotFoundError (and FileNotFoundError).
+    assert isinstance(excinfo.value, PalaceNotFoundError)
+    assert isinstance(excinfo.value, FileNotFoundError)
+
+
 def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -1009,6 +1039,59 @@ def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_pat
     seg.mkdir()
     with open(seg / "index_metadata.pickle", "wb") as f:
         pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionality(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_renames_mismatched_missing_dimensionality(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "b", 2: "a"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
 
     moved = quarantine_invalid_hnsw_metadata(str(palace))
 

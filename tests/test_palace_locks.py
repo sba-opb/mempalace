@@ -12,10 +12,12 @@ from __future__ import annotations
 import multiprocessing
 import os
 import time
+import sys
 
 import pytest
 
 from mempalace.palace import (
+    _write_lock_holder,
     MineAlreadyRunning,
     mine_global_lock,
     mine_palace_lock,
@@ -23,15 +25,17 @@ from mempalace.palace import (
 
 
 def _get_mp_context():
-    """Pick a start method that works on every CI runner.
+    """Always use ``spawn`` — ``fork`` deadlocks under modern Python.
 
-    `fork` is cheaper (no re-import) but is unavailable on Windows, so we fall
-    back to `spawn` there. `spawn` inherits ``os.environ`` (including the
-    monkeypatched ``HOME``) and re-imports the ``mempalace`` package in the
-    child, which is sufficient for the lock-file semantics exercised here.
+    The parent (pytest + chromadb + onnxruntime) is multi-threaded by the time
+    these tests run. ``fork`` snapshots that state into the child without the
+    threads that hold the locks, which Python 3.13 explicitly warns about and
+    which deadlocks the CI runners. macOS additionally forbids
+    fork-without-exec via CoreFoundation. ``spawn`` re-imports the package in
+    the child (slower, but safe) and inherits ``os.environ`` — including the
+    monkeypatched ``HOME`` — which is all these lock-file tests need.
     """
-    start_method = "spawn" if os.name == "nt" else "fork"
-    return multiprocessing.get_context(start_method)
+    return multiprocessing.get_context("spawn")
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +179,11 @@ def test_palace_path_is_normalized(tmp_path, monkeypatch):
 def test_reentrant_same_thread_passes_through(tmp_path, monkeypatch):
     """Same thread re-acquiring the same palace lock must not deadlock or raise.
 
-    This is the invariant that makes ``ChromaCollection`` write methods (which
-    take ``mine_palace_lock`` for MCP/direct-writer protection) compose with
-    ``miner.mine()`` (which already holds the lock for the entire mine
-    pipeline). Without the per-thread re-entrant guard the inner acquire
-    would self-deadlock on the outer flock.
+    This is the invariant that makes ``ChromaCollection`` write methods
+    (which take ``mine_palace_lock`` for MCP/direct-writer protection)
+    compose with ``miner.mine()`` (which already holds the lock for the
+    entire mine pipeline). Without the per-thread re-entrant guard the inner
+    acquire would self-deadlock on the outer flock.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     palace = str(tmp_path / "palace")
@@ -187,16 +191,23 @@ def test_reentrant_same_thread_passes_through(tmp_path, monkeypatch):
         # Re-enter from the same thread — must yield without raising or hanging.
         with mine_palace_lock(palace):
             pass
-        # After the inner exits, the outer is still held: confirm via a
-        # subprocess that tries to acquire and reports back.
+        # After the inner exits, the outer is still held. Use spawn so the
+        # child does not inherit the parent's open lock fd or SQLite/Chroma
+        # process state from the full test suite.
         ctx = _get_mp_context()
         result_q = ctx.Queue()
         child = ctx.Process(target=_try_acquire_expect_busy, args=(palace, result_q))
-        child.start()
-        child.join(timeout=5)
-        assert (
-            result_q.get(timeout=1) == "busy"
-        ), "outer lock should still be held by parent after inner re-entrant exit"
+        try:
+            child.start()
+            assert result_q.get(timeout=10) == "busy", (
+                "outer lock should still be held by parent after inner re-entrant exit"
+            )
+            child.join(timeout=5)
+            assert child.exitcode == 0
+        finally:
+            if child.is_alive():
+                child.terminate()
+                child.join(timeout=5)
 
 
 def _try_acquire_expect_busy(palace_path, result_q):
@@ -256,12 +267,54 @@ def test_lock_failure_message_names_holder(tmp_path, monkeypatch):
                 pytest.fail("second acquire of same palace should have raised")
 
         msg = str(excinfo.value)
-        assert (
-            f"PID {holder_pid}" in msg
-        ), f"lock-failure message must name the holder PID; got: {msg!r}"
+        assert f"PID {holder_pid}" in msg, (
+            f"lock-failure message must name the holder PID; got: {msg!r}"
+        )
     finally:
         open(release, "w").close()
         holder.join(timeout=5)
+
+
+def test_write_lock_holder_writes_utf8_bytes_for_non_ascii_argv(tmp_path, monkeypatch):
+    """Regression #1435: lock-holder identity must be written as UTF-8 bytes.
+
+    The holder byte count and the on-disk bytes must agree even when argv
+    contains characters that are not representable in a Windows ANSI codepage.
+    """
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mempalace", "mine", "café/北"],
+    )
+
+    lock_path = tmp_path / "holder.lock"
+    lock_path.write_bytes(b"\0stale-holder-identity-that-must-be-truncated")
+
+    with lock_path.open("r+b") as lock_file:
+        _write_lock_holder(lock_file)
+
+    ident = f"{os.getpid()} {' '.join(sys.argv[:3])}".strip()
+    assert lock_path.read_bytes() == b"\0" + ident.encode("utf-8")
+
+
+def test_write_lock_holder_is_best_effort_on_unicode_error(monkeypatch):
+    """Regression #1435: holder-write failures must not block lock acquisition."""
+
+    class UnicodeFailingLock:
+        def seek(self, _offset):
+            pass
+
+        def truncate(self, _size):
+            pass
+
+        def write(self, _data):
+            raise UnicodeEncodeError("cp1252", "北", 0, 1, "not representable")
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "argv", ["mempalace", "mine", "北"])
+    _write_lock_holder(UnicodeFailingLock())
 
 
 def test_lock_holder_identity_persists_across_release(tmp_path, monkeypatch):

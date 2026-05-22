@@ -2,9 +2,10 @@
 """
 MemPalace — Give your AI a memory. No API key required.
 
-Two ways to ingest:
-  Projects:      mempalace mine ~/projects/my_app          (code, docs, notes)
-  Conversations: mempalace mine <convo-dir> --mode convos     (Claude Code, Claude.ai, ChatGPT, Slack exports)
+Three ways to ingest:
+  Projects:      mempalace mine ~/projects/my_app                  (code, docs, notes)
+  Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, Claude.ai, ChatGPT, Slack exports)
+  Documents:     mempalace mine <docs-dir> --mode extract          (PDF, DOCX, PPTX, XLSX, RTF, EPUB — requires mempalace[extract])
 
 Same palace. Same search. Different ingest strategies.
 
@@ -13,6 +14,7 @@ Commands:
     mempalace split <dir>                 Split concatenated mega-files into per-session files
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
+    mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
@@ -515,6 +517,17 @@ def cmd_mine(args):
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
             )
+        elif args.mode == "extract":
+            from .format_miner import mine_formats
+
+            mine_formats(
+                format_dir=args.dir,
+                palace_path=palace_path,
+                wing=args.wing,
+                agent=args.agent,
+                limit=args.limit,
+                dry_run=args.dry_run,
+            )
         else:
             from .miner import mine
 
@@ -527,6 +540,7 @@ def cmd_mine(args):
                 dry_run=args.dry_run,
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
+                max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
@@ -577,6 +591,88 @@ def cmd_sweep(args):
     else:
         print(f"  ERROR: Not a file or directory: {target}", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_sync(args):
+    """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
+    from .mcp_server import _wal_log
+    from .palace import MineAlreadyRunning
+    from .sync import sync_palace
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    if not os.path.isdir(palace_path):
+        print(f"\n  No palace found at {palace_path}")
+        return
+    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+        print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
+        print("  Run: mempalace mine <dir>")
+        return
+
+    project_dirs = []
+    if args.dir:
+        project_dirs.append(os.path.expanduser(args.dir))
+    project_dirs.extend(os.path.expanduser(r) for r in args.root)
+    project_dirs = project_dirs or None
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Sync — Gitignore-aware drawer prune")
+    print(f"{'=' * 55}")
+    print(f"  Palace:   {palace_path}")
+    if args.wing:
+        print(f"  Wing:     {args.wing}")
+    if project_dirs:
+        for p in project_dirs:
+            print(f"  Project:  {p}")
+    if args.dry_run:
+        print("  Mode:     DRY RUN (no deletions)")
+    else:
+        print("  Mode:     APPLY (deleting drawers)")
+    print(f"{'-' * 55}\n")
+
+    try:
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=project_dirs,
+            wing=args.wing,
+            dry_run=args.dry_run,
+            wal_log=_wal_log,
+        )
+    except MineAlreadyRunning as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as exc:
+        print(f"mempalace: sync failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    removed_suffix = "(would remove)" if args.dry_run else "(removed)"
+    print(f"  Scanned:        {report['scanned']}")
+    print(f"  Kept:           {report['kept']}")
+    print(f"  Gitignored:     {report['gitignored']}  {removed_suffix}")
+    print(f"  Missing:        {report['missing']}  {removed_suffix}")
+    print(f"  No source:      {report['no_source']}  (kept)")
+    print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
+
+    by_source = report.get("by_source") or {}
+    if by_source:
+        top = sorted(by_source.items(), key=lambda kv: -kv[1])[:5]
+        label = "Top sources to remove" if args.dry_run else "Top sources removed"
+        print(f"\n  {label}:")
+        for src, n in top:
+            print(f"    {src}  ({n})")
+
+    if args.dry_run:
+        if report["gitignored"] + report["missing"] > 0:
+            print("\n  Re-run with --apply to commit these deletions.")
+    else:
+        print(
+            f"\n  Removed {report['removed_drawers']} drawers, {report['removed_closets']} closets."
+        )
+
+    print(f"\n{'=' * 55}\n")
 
 
 def cmd_search(args):
@@ -910,8 +1006,8 @@ def cmd_mcp(args):
 
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
-    from .backends.chroma import ChromaBackend
     from .dialect import Dialect
+    from .palace import get_closets_collection
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
@@ -929,13 +1025,13 @@ def cmd_compress(args):
     else:
         dialect = Dialect()
 
-    # Connect to palace
-    backend = ChromaBackend()
-    try:
-        col = backend.get_collection(palace_path, "mempalace_drawers")
-    except Exception:
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+    # State-aware open: distinguish "no palace" from "initialized but empty"
+    # from "corrupt" via the shared helper (#1498). MCP and library callers
+    # catch the backend exceptions directly; CLI gets the friendly print.
+    from .palace import _open_collection_or_explain
+
+    col = _open_collection_or_explain(palace_path, collection_name="mempalace_drawers")
+    if col is None:
         sys.exit(1)
 
     # Query drawers in batches to avoid SQLite variable limit (~999)
@@ -1007,7 +1103,10 @@ def cmd_compress(args):
     # Store compressed versions (unless dry-run)
     if not args.dry_run:
         try:
-            comp_col = backend.get_or_create_collection(palace_path, "mempalace_closets")
+            # Route through palace.get_closets_collection so the shared
+            # _DEFAULT_BACKEND is reused (avoids a redundant ChromaBackend
+            # instance and its potential WAL-lock contention on Windows).
+            comp_col = get_closets_collection(palace_path, create=True)
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
                 comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
@@ -1051,6 +1150,21 @@ def _reconfigure_stdio_utf8_on_windows():
 
 
 def main():
+    """CLI entry point for the ``mempalace`` console script.
+
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
+    any subprocess this CLI spawns inherits a clean env. Host applications
+    that call ``main()`` programmatically should be aware that the parent
+    process loses ``PYTHONPATH`` as well. Library imports
+    (``import mempalace.searcher`` from a host app) do NOT trigger this
+    side effect; only the CLI/MCP entry points pop the env var.
+    """
+    # Drop leaked PYTHONPATH so any subprocess the CLI spawns (mine workers,
+    # repair tooling) starts with a clean env. The sys.path filter in
+    # mempalace/__init__.py already protects this process from the same
+    # ABI mismatch; here we extend the protection to children.
+    os.environ.pop("PYTHONPATH", None)
+
     _reconfigure_stdio_utf8_on_windows()
 
     version_label = f"MemPalace {__version__}"
@@ -1160,9 +1274,13 @@ def main():
     p_mine.add_argument("dir", help="Directory to mine")
     p_mine.add_argument(
         "--mode",
-        choices=["projects", "convos"],
+        choices=["projects", "convos", "extract"],
         default="projects",
-        help="Ingest mode: 'projects' for code/docs (default), 'convos' for chat exports",
+        help=(
+            "Ingest mode: 'projects' for code/docs (default), 'convos' for chat "
+            "exports, 'extract' for office documents (PDF/DOCX/RTF/etc., requires "
+            "mempalace[extract])"
+        ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
@@ -1202,6 +1320,20 @@ def main():
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
     )
+    from . import miner as _miner_for_default
+
+    p_mine.add_argument(
+        "--max-chunks-per-file",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            f"Per-file chunk cap; files producing more chunks are skipped with a "
+            f"summary counter. Default {_miner_for_default.MAX_CHUNKS_PER_FILE} "
+            f"(or MEMPALACE_MAX_CHUNKS_PER_FILE). Set 0 to disable. Lower this on "
+            f"Windows if you hit ONNX bad_alloc (#1455)."
+        ),
+    )
 
     # sweep
     p_sweep = sub.add_parser(
@@ -1212,6 +1344,38 @@ def main():
     p_sweep.add_argument(
         "target",
         help="A .jsonl transcript file, or a directory to scan recursively",
+    )
+
+    # sync
+    p_sync = sub.add_parser(
+        "sync",
+        help="Prune drawers whose source files are gitignored, deleted, or moved (#1252)",
+    )
+    p_sync.add_argument(
+        "dir",
+        nargs="?",
+        default=None,
+        help="Project root to sync (optional; auto-detects from drawer metadata)",
+    )
+    p_sync.add_argument("--wing", default=None, help="Limit to one wing")
+    p_sync.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        help="Additional project root (repeatable)",
+    )
+    p_sync.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=True,
+        help="Preview only (default)",
+    )
+    p_sync.add_argument(
+        "--apply",
+        dest="dry_run",
+        action="store_false",
+        help="Actually delete drawers (overrides --dry-run; requires --wing or a project root)",
     )
 
     # search
@@ -1422,6 +1586,7 @@ def main():
         "split": cmd_split,
         "search": cmd_search,
         "sweep": cmd_sweep,
+        "sync": cmd_sync,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,

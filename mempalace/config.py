@@ -7,6 +7,7 @@ Priority: env vars > config file (~/.mempalace/config.json) > defaults
 import json
 import os
 import re
+from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -82,36 +83,89 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     return value
 
 
-# ISO-8601 date validator for knowledge-graph temporal parameters
-# (as_of, valid_from, valid_to, ended). Parameterized queries already
-# prevent SQL injection, but unvalidated date strings silently miss
-# every row — callers cannot distinguish "no fact at this time" from
-# "your date format was unrecognized." Require full YYYY-MM-DD: KG
-# queries compare TEXT dates lexicographically, so partials like "2026"
-# would re-introduce silent empty results (e.g. "2026-01-01" <= "2026"
-# is False), defeating the purpose of validation.
+# ISO-8601 temporal validator for knowledge-graph temporal parameters
+# (as_of, valid_from, valid_to, ended).
+#
+# The KG stores temporal values as TEXT. Lexicographic comparisons are only
+# safe when datetime values use one canonical shape. Accept full dates for
+# legacy compatibility and exact UTC datetimes for sub-day precision.
+#
+# Accepted:
+#   YYYY-MM-DD
+#   YYYY-MM-DDTHH:MM:SSZ
+#   YYYY-MM-DDTHH:MM:SS+00:00  (normalized to ...Z)
+#
+# Rejected:
+#   partial dates, naive datetimes, non-UTC timezone offsets, fractional
+#   seconds, and SQLite-style space-separated datetimes.
 _ISO_DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
 
+_ISO_UTC_DATETIME_RE = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:Z|\+00:00)$"
+)
 
-def sanitize_iso_date(value, field_name: str = "date"):
-    """Validate an ISO-8601 date string, accepting None or empty as-is.
 
-    Accepts only ``YYYY-MM-DD``. Raises ValueError on any other
-    non-empty input so the MCP layer can surface a clear error to the
-    caller instead of silently returning empty results. Partial dates
-    (``YYYY``, ``YYYY-MM``) are rejected because KG queries compare
-    TEXT dates lexicographically and would silently exclude valid facts.
+def _validate_iso_temporal_calendar(value: str) -> None:
+    """Reject impossible calendar values after regex shape validation."""
+
+    if _ISO_DATE_RE.match(value):
+        date.fromisoformat(value)
+        return
+
+    if _ISO_UTC_DATETIME_RE.match(value):
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return
+
+    raise ValueError
+
+
+def sanitize_iso_temporal(value, field_name: str = "date"):
+    """Validate an ISO-8601 date or canonical UTC datetime string.
+
+    Accepts ``None`` and ``""`` as pass-through values.
+
+    Accepted non-empty string forms:
+
+    - ``YYYY-MM-DD``
+    - ``YYYY-MM-DDTHH:MM:SSZ``
+    - ``YYYY-MM-DDTHH:MM:SS+00:00`` normalized to ``...Z``
+
+    Partial dates are rejected because KG queries compare TEXT temporal values.
+    Non-canonical datetime forms are rejected because mixed temporal string
+    formats can silently return wrong KG query results.
     """
+
     if value is None or value == "":
         return value
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")
+
     value = value.strip()
-    if not _ISO_DATE_RE.match(value):
+
+    try:
+        _validate_iso_temporal_calendar(value)
+    except ValueError:
         raise ValueError(
-            f"{field_name}={value!r} is not a valid ISO-8601 date " f"(expected YYYY-MM-DD)"
-        )
+            f"{field_name}={value!r} is not a valid ISO-8601 date or UTC datetime "
+            "(expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)"
+        ) from None
+
+    if value.endswith("+00:00"):
+        value = f"{value[:-6]}Z"
+
     return value
+
+
+def sanitize_iso_date(value, field_name: str = "date"):
+    """Backward-compatible wrapper for ISO temporal validation.
+
+    Historically this accepted only full dates. It now also accepts canonical
+    UTC datetimes, but the old name is kept so existing imports continue to
+    work.
+    """
+
+    return sanitize_iso_temporal(value, field_name)
 
 
 def sanitize_content(value: str, max_length: int = 100_000) -> str:
@@ -134,6 +188,15 @@ def get_configured_collection_name() -> str:
     """Return the configured drawer collection name without repeated config-file reads."""
     return MempalaceConfig().collection_name
 
+
+# Single source of truth for chunking defaults. ``mempalace.miner``
+# imports these so the legacy module-level ``CHUNK_SIZE`` /
+# ``CHUNK_OVERLAP`` / ``MIN_CHUNK_SIZE`` constants stay in sync with
+# ``MempalaceConfig.chunk_*``. Putting them here (not in miner.py) keeps
+# the config layer self-contained and avoids circular imports.
+DEFAULT_CHUNK_SIZE = 800
+DEFAULT_CHUNK_OVERLAP = 100
+DEFAULT_MIN_CHUNK_SIZE = 50
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -225,6 +288,11 @@ class MempalaceConfig:
         return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
 
     @property
+    def tunnel_file(self):
+        """Path to the tunnel file, sibling of palace_path."""
+        return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
+
+    @property
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
@@ -249,6 +317,113 @@ class MempalaceConfig:
     def hall_keywords(self):
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
+
+    @staticmethod
+    def _try_coerce_int(value, minimum=None):
+        """Coerce a raw config value to int, or ``None`` if it cannot be a
+        valid setting.
+
+        bool, empty/garbage string, non-numeric, and below-``minimum``
+        values all return ``None``. Shared by ``_coerce_config_int``
+        (which substitutes a documented default) and
+        ``min_chunk_size_explicit`` (which must distinguish "unusable"
+        from "explicitly set" without crashing the convo path).
+        """
+        if isinstance(value, bool):
+            return None
+        try:
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return None
+            value = int(value)
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: JSON ``1e1000`` parses to float('inf'), and
+            # ``int(inf)`` raises it — still just garbage config, not a crash.
+            return None
+        if minimum is not None and value < minimum:
+            return None
+        return value
+
+    def _coerce_config_int(self, key: str, default: int, minimum=None) -> int:
+        """Read an int config value, falling back to ``default`` on bad input.
+
+        Hand-edited ``config.json`` is the most common source of garbage:
+        a string, a bool, a negative number, or a JSON null. None of those
+        should crash mining or hang ``chunk_text()`` — fall back silently
+        to the documented default rather than letting a typo break ingest.
+        """
+        coerced = self._try_coerce_int(self._file_config.get(key, default), minimum)
+        return default if coerced is None else coerced
+
+    def _validated_chunk_config(self):
+        """Return ``(chunk_size, chunk_overlap, min_chunk_size)`` post-validation.
+
+        Enforces the invariants the miner relies on:
+          * ``chunk_size >= 1``
+          * ``0 <= chunk_overlap < chunk_size`` — equality would loop forever
+          * ``min_chunk_size <= chunk_size`` — otherwise no chunk is ever
+            large enough to file, and ingest silently produces 0 drawers
+
+        Repairs (rather than raises) on violation so a single bad
+        config.json key doesn't take ingest down.
+        """
+        chunk_size = self._coerce_config_int("chunk_size", DEFAULT_CHUNK_SIZE, minimum=1)
+        chunk_overlap = self._coerce_config_int("chunk_overlap", DEFAULT_CHUNK_OVERLAP, minimum=0)
+        min_chunk_size = self._coerce_config_int(
+            "min_chunk_size", DEFAULT_MIN_CHUNK_SIZE, minimum=0
+        )
+
+        if chunk_overlap >= chunk_size:
+            chunk_overlap = (
+                DEFAULT_CHUNK_OVERLAP
+                if DEFAULT_CHUNK_OVERLAP < chunk_size
+                else max(0, chunk_size - 1)
+            )
+
+        if min_chunk_size > chunk_size:
+            min_chunk_size = (
+                DEFAULT_MIN_CHUNK_SIZE if DEFAULT_MIN_CHUNK_SIZE <= chunk_size else chunk_size
+            )
+
+        return chunk_size, chunk_overlap, min_chunk_size
+
+    @property
+    def chunk_size(self) -> int:
+        """Characters per drawer chunk (validated, ``>= 1``)."""
+        return self._validated_chunk_config()[0]
+
+    @property
+    def chunk_overlap(self) -> int:
+        """Overlap between adjacent chunks (validated, ``< chunk_size``)."""
+        return self._validated_chunk_config()[1]
+
+    @property
+    def min_chunk_size(self) -> int:
+        """Minimum chunk size — skip smaller chunks (validated, ``<= chunk_size``)."""
+        return self._validated_chunk_config()[2]
+
+    @property
+    def min_chunk_size_explicit(self):
+        """Validated ``min_chunk_size`` iff the user explicitly set it.
+
+        Returns the coerced int when ``config.json`` defines a usable
+        ``min_chunk_size`` (``>= 0`` and ``<= chunk_size``); ``None`` when
+        the key is absent/null or the value is unusable. ``convo_miner``
+        relies on the ``None`` sentinel to keep its lower 30-char floor
+        (more permissive than the 50-char project default, so short
+        exchanges are not dropped) for untuned users while still honoring
+        an explicit override —
+        replacing the raw, unvalidated ``_file_config`` reach that crashed
+        convo ingest on a bad key (#1024 review).
+        """
+        raw = self._file_config.get("min_chunk_size")
+        if raw is None:
+            return None
+        coerced = self._try_coerce_int(raw, minimum=0)
+        if coerced is None or coerced > self.chunk_size:
+            return None
+        return coerced
 
     @property
     def entity_languages(self):
@@ -359,6 +534,14 @@ class MempalaceConfig:
         except (OSError, NotImplementedError):
             pass  # Windows doesn't support Unix permissions
         if not self._config_file.exists():
+            # Chunking parameters (chunk_size, chunk_overlap, min_chunk_size)
+            # are intentionally NOT written here — convo_miner.py distinguishes
+            # "user has tuned this" from "user is on defaults" by checking
+            # ``_file_config.get("min_chunk_size") is None``. Writing the
+            # miner.py defaults (50) into config.json breaks that detection
+            # and silently overrides convo_miner's stricter 30-char floor,
+            # dropping legitimate short conversation exchanges. Module-level
+            # defaults already apply correctly when these keys are absent.
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
                 "collection_name": DEFAULT_COLLECTION_NAME,
