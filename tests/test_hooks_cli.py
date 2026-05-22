@@ -81,6 +81,44 @@ def test_mempalace_python_finds_venv():
     assert result and "python" in os.path.basename(result).lower()
 
 
+def test_mempalace_python_handles_shallow_path_without_crashing(monkeypatch):
+    """Regression: _mempalace_python must not raise IndexError when the
+    package lives at a shallow filesystem path.
+
+    The function indexes ``Path(__file__).resolve().parents[3]`` to find the
+    venv root in a standard ``<venv>/lib/python3.X/site-packages/mempalace/``
+    install. In editable installs at a shallow path (Docker containers
+    mounting at ``/work``, ``/opt/app``, etc.), ``parents`` has fewer than
+    4 elements and the index raises ``IndexError``. Affected sites where
+    this surfaces: Docker-based dev, OrbStack-style cross-platform CI,
+    minimal-prefix production installs.
+
+    The fix guards the ``parents[3]`` access so the function falls through
+    to the editable-install case (parents[1]) and ultimately to
+    sys.executable, instead of crashing.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from pathlib import Path as RealPath
+
+    # Build a fake Path whose .resolve().parents has only 3 elements
+    # (indexes 0, 1, 2 — so [3] would raise IndexError).
+    fake_path = MagicMock()
+    # parents[1] still works (editable-install branch)
+    fake_parents = MagicMock()
+    fake_parents.__getitem__ = lambda self, idx: (
+        RealPath("/work/mempalace") if idx == 1 else (_ for _ in ()).throw(IndexError(idx))
+    )
+    fake_path.resolve.return_value.parents = fake_parents
+
+    with patch("mempalace.hooks_cli.Path", return_value=fake_path):
+        # Must not raise; must return SOME string (either editable-venv
+        # fallback path or sys.executable).
+        result = _mempalace_python()
+        assert isinstance(result, str)
+        assert "python" in result.lower()
+
+
 # --- _sanitize_session_id ---
 
 

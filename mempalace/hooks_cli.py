@@ -75,13 +75,28 @@ def _mempalace_python() -> str:
         return env_python
     # This file lives at <venv>/lib/pythonX.Y/site-packages/mempalace/hooks_cli.py
     # or <project>/mempalace/hooks_cli.py (editable install).
-    venv_bin = Path(__file__).resolve().parents[3] / "bin" / "python"
-    if venv_bin.is_file():
-        return str(venv_bin)
+    #
+    # Both ``parents[3]`` and ``parents[1]`` access can raise IndexError when
+    # the package lives at a shallow filesystem path — Docker containers
+    # mounting at ``/work``, ``/opt/app``, or other minimal-prefix installs
+    # don't have 4 (or sometimes even 2) parent directories. Guard each
+    # access so we fall through to the next strategy instead of crashing
+    # the hook with an IndexError that would kill any Claude-Code session
+    # using mempalace.
+    resolved = Path(__file__).resolve()
+    try:
+        venv_bin = resolved.parents[3] / "bin" / "python"
+        if venv_bin.is_file():
+            return str(venv_bin)
+    except IndexError:
+        pass
     # Editable install: assumes project root has a venv/ sibling to mempalace/
-    project_venv = Path(__file__).resolve().parents[1] / "venv" / "bin" / "python"
-    if project_venv.is_file():
-        return str(project_venv)
+    try:
+        project_venv = resolved.parents[1] / "venv" / "bin" / "python"
+        if project_venv.is_file():
+            return str(project_venv)
+    except IndexError:
+        pass
     return sys.executable
 
 
