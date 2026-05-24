@@ -22,7 +22,9 @@ from typing import Optional
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    MineValidationError,
     _open_collection_or_explain,
+    _validate_palace_fts5_after_mine,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
@@ -1739,6 +1741,8 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
+            _validate_palace_fts5_after_mine(palace_path)
+
         print(f"\n{'=' * 55}")
         print("  Done.")
         print(f"  Files processed: {len(files) - files_skipped}")
@@ -1783,6 +1787,13 @@ def _mine_impl(
             "already-filed drawers are\n  upserted idempotently and will not duplicate.\n"
         )
         sys.exit(130)
+    except MineValidationError:
+        # End-of-mine FTS5 validation failed (#1537). The loop completed
+        # successfully; cmd_mine prints the recovery banner. Don't print a
+        # "Mine aborted" partial-progress summary here: the mine didn't
+        # abort mid-loop, the post-write integrity check did, and the
+        # double-banner would mislead the operator.
+        raise
     except Exception as exc:
         # Without this, an arbitrary exception (ONNX bad_alloc, chromadb HNSW
         # error, OS fault) propagates and the process exits with no completion

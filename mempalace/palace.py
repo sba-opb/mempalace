@@ -458,6 +458,42 @@ class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
 
 
+class MineValidationError(RuntimeError):
+    """Raised at end of mine when PRAGMA quick_check on the palace reports errors."""
+
+    def __init__(self, palace_path: str, errors: list[str]) -> None:
+        if not errors:
+            raise ValueError("MineValidationError requires at least one error string")
+        if not palace_path:
+            raise ValueError("MineValidationError requires a non-empty palace_path")
+        super().__init__(f"FTS5/SQLite quick_check failed: {len(errors)} issue(s)")
+        self.palace_path = palace_path
+        # Freeze the forensic snapshot so handlers cannot mutate it.
+        self.errors: tuple[str, ...] = tuple(errors)
+
+
+def _validate_palace_fts5_after_mine(palace_path: str) -> None:
+    """Raise MineValidationError if PRAGMA quick_check reports any error after a mine.
+
+    Reuses the same primitive that `cmd_repair` already runs as preflight so the
+    operator sees the same recovery banner regardless of which command surfaces
+    the bug.
+    """
+    # Defer-import: keeps the repair module graph out of mine's hot import path.
+    from .repair import _close_chroma_handles, sqlite_integrity_errors
+
+    # Pass the live singleton so the writer's cached PersistentClient actually
+    # gets closed and WAL flushes before the read-only sqlite3 re-open.
+    # A transient ChromaBackend (the default) would only clear its own empty
+    # `_clients` dict and leave _DEFAULT_BACKEND's live handle in place,
+    # which on Windows keeps the sqlite file mmap'd.
+    _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
+
+    errors = sqlite_integrity_errors(palace_path)
+    if errors:
+        raise MineValidationError(palace_path, errors)
+
+
 # Per-thread record of palaces this thread already holds the lock for. Used by
 # `mine_palace_lock` to short-circuit re-entrant acquisition from the same
 # thread (e.g. miner.mine() acquires the outer lock then calls
