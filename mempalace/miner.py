@@ -865,13 +865,20 @@ def _extract_entities_for_metadata(content: str) -> str:
         if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
             matched.add(name)
 
+    from .entity_detector import _get_coca_filter
     from .palace import _candidate_entity_words
 
+    coca_filter = _get_coca_filter()
     window = content[:_ENTITY_EXTRACT_WINDOW]
     words = _candidate_entity_words(window)
     freq: dict = {}
     for w in words:
         if w in _ENTITY_STOPLIST:
+            continue
+        # Tier 2 linguistics cleanup — drop common English content words
+        # ("Code", "Line", "Note", "Phase", …) from per-drawer entity
+        # metadata so they don't poison hallways/tunnels/search.
+        if w.lower() in coca_filter:
             continue
         freq[w] = freq.get(w, 0) + 1
     for w, c in freq.items():

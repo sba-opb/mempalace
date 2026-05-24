@@ -264,10 +264,18 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
 
     # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
     # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
+    from .entity_detector import _get_coca_filter
+
+    coca_filter = _get_coca_filter()
     words = _candidate_entity_words(window)
     word_freq = {}
     for w in words:
         if w in _ENTITY_STOPLIST:
+            continue
+        # Tier 2 linguistics cleanup — drop common English content words
+        # ("Code", "Line", "Note", "Phase", …) so they don't appear in
+        # closet pointers as fake entities.
+        if w.lower() in coca_filter:
             continue
         word_freq[w] = word_freq.get(w, 0) + 1
     entities = sorted(
