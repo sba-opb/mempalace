@@ -113,6 +113,15 @@ esac
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 SOURCE_DIR="$_script_dir"
 
+# Resolve --install-dir to an absolute path before it gets baked into
+# hooks.json. Cursor invokes hook commands from its own working
+# directory (typically the project root), so a relative command path
+# would silently fail to launch the hook. gh-PR review caught this.
+case "$INSTALL_DIR" in
+    /*) ;;
+    *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;;
+esac
+
 # Resolve the Python interpreter the same way the hooks themselves do
 # so a user with a non-default Python is consistent across install +
 # runtime.
@@ -185,10 +194,12 @@ fi
 #   * recognising MemPalace entries by basename in the `command` field
 #   * idempotent install (re-running does not duplicate entries)
 
-# mktemp portability: BSD mktemp wants the template positional, GNU
-# accepts -t with a suffix. The common subset is `mktemp -t prefix`
-# (BSD picks up TMPDIR; GNU emits a path under /tmp). Both work.
-MERGE_PY="$(mktemp -t mempal-install-merge.XXXXXX)"
+# mktemp portability: pass an explicit absolute template so we sidestep
+# the BSD vs GNU difference in `-t` semantics (BSD treats it as a
+# prefix; GNU treats it as a template). Honour TMPDIR if set, fall
+# back to /tmp. gh-PR review caught the previous `-t` form as
+# non-portable.
+MERGE_PY="$(mktemp "${TMPDIR:-/tmp}/mempal-install-merge.XXXXXX")"
 trap 'rm -f "$MERGE_PY"' EXIT
 
 cat > "$MERGE_PY" <<'PYEOF'
@@ -357,21 +368,18 @@ mkdir -p "$TARGET_DIR"
 # keys beyond version, remove the file entirely so the user's
 # `.cursor/` directory does not accumulate orphan configs.
 if [ "$UNINSTALL" -eq 1 ]; then
-    EMPTY_CHECK_PY="$(mktemp -t mempal-install-empty.XXXXXX)"
-    cat > "$EMPTY_CHECK_PY" <<'PYEOF'
-"""Returns "1" (non-empty) or "0" (empty) on stdout for use by the
-shell caller. 'Empty' means: no hook entries and no top-level keys
-other than 'version' / 'hooks'."""
-import json
-import sys
-
+    # Inline the emptiness check via `python -c '...'` rather than a
+    # temp .py file. The body is short enough that a tmpfile is pure
+    # overhead, and removing the tmpfile eliminates a small leak
+    # window if the script is interrupted between mktemp and rm -f.
+    # gh-PR review suggested this simplification.
+    NON_EMPTY="$(printf '%s' "$NEW_JSON" | "$PYTHON_BIN" -c '
+import json, sys
 cfg = json.load(sys.stdin)
 hooks = cfg.get("hooks", {})
 extras = [k for k in cfg.keys() if k not in ("version", "hooks")]
 print("1" if (hooks or extras) else "0")
-PYEOF
-    NON_EMPTY="$(printf '%s' "$NEW_JSON" | "$PYTHON_BIN" "$EMPTY_CHECK_PY")"
-    rm -f "$EMPTY_CHECK_PY"
+')"
     if [ "$NON_EMPTY" = "0" ] && [ -f "$TARGET_FILE" ]; then
         rm -f "$TARGET_FILE"
         printf 'install.sh: removed empty %s\n' "$TARGET_FILE" >&2

@@ -61,8 +61,11 @@ _mempal_dir="$(cd "$(dirname "$_mempal_self")" 2>/dev/null && pwd)"
 . "$_mempal_dir/lib/common.sh"
 
 SAVE_INTERVAL="${MEMPAL_SAVE_INTERVAL:-15}"
+# Coerce empty, non-numeric, AND zero to the default. SAVE_INTERVAL=0
+# would otherwise crash bash on the modulo check below ($((NEXT % 0))
+# is "division by 0"). gh-PR review caught this edge case.
 case "$SAVE_INTERVAL" in
-    ''|*[!0-9]*) SAVE_INTERVAL=15 ;;
+    ''|*[!0-9]*|0) SAVE_INTERVAL=15 ;;
 esac
 
 # Optional additional project directory to mine on save (parity with

@@ -396,3 +396,74 @@ def test_invalid_variant_rejected(tmp_path):
     )
     assert p.returncode != 0
     assert "variant" in p.stderr.lower()
+
+
+# ── --install-dir path resolution ───────────────────────────────────
+
+
+class TestInstallDirAbsolutePath:
+    """Regression for gh-PR review: a relative ``--install-dir`` must
+    be resolved to an absolute path BEFORE it is written into
+    ``hooks.json``. Cursor invokes hook commands from its own working
+    directory (typically the project root), so a relative command path
+    would silently fail to launch the hook.
+    """
+
+    def test_relative_install_dir_is_absolutized_in_hooks_json(self, tmp_path):
+        # Run install from a known cwd with a relative --install-dir.
+        # The resulting hooks.json must reference an absolute path.
+        cwd = tmp_path / "run-from-here"
+        cwd.mkdir()
+        relative_install_dir = "rel-install"
+        # NOTE: we deliberately do NOT pre-create the directory — the
+        # installer itself creates it. The test asserts on the path
+        # baked into hooks.json, not on filesystem state.
+        env = {
+            "HOME": str(tmp_path),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "MEMPAL_PYTHON": sys.executable,
+        }
+        p = subprocess.run(
+            [
+                "bash",
+                str(INSTALL_SH),
+                "--scope",
+                "project",
+                "--target",
+                str(tmp_path),
+                "--install-dir",
+                relative_install_dir,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(cwd),
+            timeout=30,
+        )
+        assert p.returncode == 0, f"install failed: {p.stderr!r}"
+        cfg = json.loads(_hooks_file(tmp_path).read_text())
+        expected_abs = str(cwd / relative_install_dir)
+        stop_cmd = cfg["hooks"]["stop"][0]["command"]
+        assert stop_cmd.startswith("/"), (
+            f"hook command must be absolute path, not relative; got {stop_cmd!r}"
+        )
+        assert stop_cmd.startswith(expected_abs), (
+            f"hook command must be resolved against cwd={cwd!s}; got {stop_cmd!r}"
+        )
+
+    def test_absolute_install_dir_is_preserved_verbatim(self, tmp_path):
+        """The relative-to-absolute resolution must not mangle paths
+        that were already absolute."""
+        abs_install_dir = tmp_path / "abs-install"
+        _run_install(
+            "--install-dir",
+            str(abs_install_dir),
+            target=tmp_path,
+            home=tmp_path,
+        )
+        cfg = json.loads(_hooks_file(tmp_path).read_text())
+        stop_cmd = cfg["hooks"]["stop"][0]["command"]
+        assert stop_cmd.startswith(str(abs_install_dir)), (
+            f"absolute --install-dir must be preserved verbatim; "
+            f"got {stop_cmd!r} for input {abs_install_dir!s}"
+        )

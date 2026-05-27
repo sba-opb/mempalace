@@ -91,7 +91,12 @@ mempal_is_disabled() {
     local cfg="$HOME/.mempalace/config.json"
     if [ -f "$cfg" ]; then
         local result
-        result="$("$MEMPAL_PYTHON_BIN" - "$cfg" <<'PYEOF' 2>/dev/null
+        # Use python -c '...' with the config path as argv[1] rather
+        # than a heredoc. A heredoc body that contains parens inside a
+        # $(...) command substitution trips the bash 3.2.57 parser
+        # bug (macOS /bin/bash default) — gh-PR review caught this.
+        # The -c form is also consistent with mempal_parse_stdin below.
+        result="$("$MEMPAL_PYTHON_BIN" -c '
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -99,8 +104,7 @@ try:
     print(str(cfg.get("hooks", {}).get("auto_save", True)).lower())
 except Exception:
     print("true")
-PYEOF
-)"
+' "$cfg" 2>/dev/null)"
         if [ "$result" = "false" ]; then
             return 0
         fi

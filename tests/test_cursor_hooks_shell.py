@@ -362,6 +362,21 @@ class TestSaveHookCounter:
         msg = json.loads(out)["followup_message"]
         assert "sampleproj" in msg, f"followup should reference inferred wing; got {msg!r}"
 
+    def test_save_interval_zero_is_coerced_to_default(self, tmp_path):
+        """Regression for gh-PR review: MEMPAL_SAVE_INTERVAL=0 would
+        otherwise crash bash on `$((NEXT % 0))` (division by zero).
+        Zero must be coerced to the default interval (15) so the hook
+        survives a misconfigured env var without exiting non-zero.
+        """
+        env = {"MEMPAL_SAVE_INTERVAL": "0"}
+        # Three independent invocations: each must succeed (rc=0) and
+        # emit {} since the coerced interval (15) is never reached.
+        for _ in range(3):
+            out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
+            assert json.loads(out) == {}, (
+                f"SAVE_INTERVAL=0 must coerce to default and pass through; got {out!r}"
+            )
+
 
 # ── save hook: loop-prevention ──────────────────────────────────────
 
