@@ -344,6 +344,74 @@ mempal_consume_pending() {
     return 1
 }
 
+# ── State-file TTL ────────────────────────────────────────────────────
+#
+# Per-conversation state artifacts (cursor_<conv>.count and
+# cursor_<conv>.pending) accumulate one set per conversation and are
+# never otherwise removed (igorls review, PR #1632 — unbounded state
+# growth). Reads MEMPAL_STATE_TTL_DAYS (default 30), validated
+# digits-only and leading-zero-stripped (mirrors the SAVE_INTERVAL
+# sanitiser) so `find -mtime` never sees a bad or octal token. Empty or
+# non-numeric floors to 30; a value of 0 means "sweep everything older
+# than today".
+mempal_state_ttl_days() {
+    local raw="${MEMPAL_STATE_TTL_DAYS:-30}"
+    case "$raw" in
+        ''|*[!0-9]*) printf '30'; return 0 ;;
+    esac
+    while [ "${raw}" != "${raw#0}" ] && [ "${#raw}" -gt 1 ]; do
+        raw="${raw#0}"
+    done
+    printf '%s' "$raw"
+}
+
+# ── Stale state GC ────────────────────────────────────────────────────
+#
+# Opportunistic sweep of per-conversation Cursor state older than the
+# TTL. Throttled to at most once per 24h via the cursor_last_sweep
+# marker, so it costs a single mtime comparison on the vast majority of
+# fires. When it does run, two `find` passes remove the stale counter
+# files and pending markers.
+#
+# The globs are Cursor-specific and suffix-anchored (cursor_*.count,
+# cursor_*.pending), so the shared logs (cursor_hook.log,
+# cursor_last_input.log, cursor_last_python_err.log), the
+# cursor_last_sweep marker itself, and any antigravity_*/Claude state
+# sharing the same directory are never touched. BSD find (macOS default)
+# and GNU find both accept -maxdepth, -mtime +N, and -exec ... +.
+#
+# Fail-open: every step is best-effort; a missing state dir, a find that
+# errors, or a permission problem must never abort the caller.
+mempal_gc_stale_state() {
+    [ -d "$MEMPAL_STATE_DIR" ] || return 0
+
+    local marker="$MEMPAL_STATE_DIR/cursor_last_sweep"
+    if [ -f "$marker" ]; then
+        local mtime now
+        if mtime=$(date -r "$marker" '+%s' 2>/dev/null) \
+           && now=$(date '+%s' 2>/dev/null) \
+           && [ -n "$mtime" ] \
+           && [ "$((now - mtime))" -lt 86400 ]; then
+            return 0
+        fi
+    fi
+    # Touch the marker first so a crash mid-sweep still throttles the
+    # next fire (better to skip a sweep than to hammer the disk).
+    : > "$marker" 2>/dev/null
+
+    local ttl
+    ttl=$(mempal_state_ttl_days)
+
+    find "$MEMPAL_STATE_DIR" -maxdepth 1 -type f \
+        -name 'cursor_*.count' -mtime +"$ttl" \
+        -exec rm -f {} + 2>/dev/null
+    find "$MEMPAL_STATE_DIR" -maxdepth 1 -type f \
+        -name 'cursor_*.pending' -mtime +"$ttl" \
+        -exec rm -f {} + 2>/dev/null
+
+    return 0
+}
+
 # ── Workspace → wing inference ────────────────────────────────────────
 #
 # basename(workspace_root), normalised to [a-z0-9_-]. Edge cases:

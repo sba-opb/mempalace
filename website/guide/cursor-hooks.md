@@ -109,9 +109,18 @@ where they overlap.
 
 - **`MEMPAL_SAVE_INTERVAL=15`** — number of `stop` events between save
   followups. Lower = more frequent saves, higher = less interruption.
+- **`MEMPAL_CURSOR_SILENT=1`** — suppress the `followup_message` entirely
+  (the hook still runs its best-effort background mine and keeps its
+  counters). `MEMPAL_VERBOSE=false`/`0`/`no` is equivalent. Note the
+  followup is **on by default** for Cursor — see "Why the followup is on
+  by default" below.
 - **`MEMPAL_STATE_DIR`** — where the hook keeps counter files, the
   pending-save marker, and `cursor_hook.log`. Defaults to
   `~/.mempalace/hook_state/`.
+- **`MEMPAL_STATE_TTL_DAYS=30`** — age after which stale
+  `cursor_*.count` / `cursor_*.pending` files are swept. The hooks run a
+  daily-throttled garbage collection so per-conversation state can't grow
+  unbounded; only Cursor's own state is touched.
 - **`MEMPAL_DIR`** — optional project directory (code, notes, docs) to
   also mine on each save trigger, with `--mode projects`. The transcript
   is always mined regardless — `MEMPAL_DIR` is purely additive.
@@ -217,6 +226,17 @@ which can block until the AI has saved. We work around the limitation by
 mining the verbatim transcript synchronously (zero LLM cost) and queueing
 a save nudge for the next agent turn.
 
+::: tip Why synchronous (and what happens on a slow mine)
+The pre-compaction mine runs **synchronously** on purpose: compaction is
+irreversible, so we must finish ingesting before the hook returns —
+background mining would race the compaction. On a very large transcript
+this can exceed Cursor's per-hook timeout, in which case Cursor kills the
+mine mid-run. That is safe: `mempalace mine` is incremental and
+append-only, so a killed mine resumes cleanly on the next invocation
+rather than corrupting the palace, and the pending-save marker still
+forces a re-mine plus a verbatim save nudge on the next `stop`.
+:::
+
 ## Cursor-only extras
 
 The features below are not available in the Claude Code or Codex hooks
@@ -268,11 +288,34 @@ misconfiguration cannot grow disk usage.
 
 ## Cost
 
-**Zero extra tokens.** The hooks are bash scripts that run locally. They
-do not call any API. The `followup_message` the save hook emits is a
-normal user turn — it counts the same as any other user message and does
-not invoke any extra LLM call beyond the one the user would otherwise
-make.
+**Zero extra tokens spent by the hooks themselves.** The hooks are bash
+scripts that run locally. They do not call any API. The `followup_message`
+the save hook emits is a normal user turn — it counts the same as any
+other user message and does not invoke any extra LLM call beyond the one
+the user would otherwise make. To suppress it entirely, set
+`MEMPAL_CURSOR_SILENT=1`.
+
+## Why the followup is on by default
+
+The Claude Code hook is **silent by default**: its background `mempalace
+mine --mode convos` captures the verbatim transcript on its own (because
+`normalize.py` has a Claude Code JSONL parser), and the LLM-driven diary
+nudge is opt-in behind `MEMPAL_VERBOSE`.
+
+Cursor is different. Cursor's transcript format is **undocumented** and
+`normalize.py` has **no Cursor parser**, so the background mine is
+best-effort only and does not yet yield clean verbatim drawers. That makes
+the `followup_message` — which drives the agent to file its own in-context
+verbatim quotes via `mempalace_add_drawer` / `mempalace_diary_write` — the
+**load-bearing verbatim-capture path** for Cursor. Turning it off by
+default would leave a default install capturing nothing, so it is on by
+default.
+
+If you want the Claude-style "zero tokens in the chat window" behaviour
+and accept the reduced capture, set `MEMPAL_CURSOR_SILENT=1` (or
+`MEMPAL_VERBOSE=false`). The proper long-term fix is a Cursor transcript
+parser in `normalize.py` (tracked follow-up); once that works, this
+default flips to silent to match Claude.
 
 ## Known limitations
 
@@ -284,9 +327,13 @@ make.
 - **`preCompact` cannot block.** See the diagram above. The
   pending-save marker is the workaround.
 - **Transcript file format is opaque.** Cursor does not document the
-  schema of the file at `transcript_path`. MemPalace's `mempalace mine`
-  command handles it via its normaliser layer; the hooks themselves never
-  parse the transcript directly.
+  schema of the file at `transcript_path`, and `mempalace/normalize.py`
+  has no Cursor parser yet, so the background `mempalace mine --mode
+  convos` is **best-effort** for Cursor — it does not yet produce clean
+  verbatim conversation drawers. The `followup_message` is the
+  load-bearing capture path (see below). Adding a Cursor parser to
+  `normalize.py` is tracked follow-up work; once it lands, the followup
+  can default to silent like the Claude hook.
 
 ## Related
 

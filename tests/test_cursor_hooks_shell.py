@@ -32,6 +32,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -378,6 +379,61 @@ class TestSaveHookCounter:
             )
 
 
+# ── save hook: followup opt-out ─────────────────────────────────────
+
+
+class TestSaveHookFollowupSilence:
+    """The Cursor followup_message is ON by default (it is the
+    load-bearing verbatim path because Cursor's transcript is unminable),
+    but users can silence it. These tests lock the opt-out contract.
+    """
+
+    def test_followup_on_by_default_at_threshold(self, tmp_path):
+        """Sanity baseline: with no silence flag, the threshold emits a
+        followup. Guards against an accidental default flip."""
+        env = {"MEMPAL_SAVE_INTERVAL": "1"}
+        out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
+        assert "followup_message" in json.loads(out)
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+    def test_cursor_silent_suppresses_followup(self, value, tmp_path):
+        env = {"MEMPAL_SAVE_INTERVAL": "1", "MEMPAL_CURSOR_SILENT": value}
+        out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
+        assert json.loads(out) == {}, (
+            f"MEMPAL_CURSOR_SILENT={value!r} must suppress the followup; got {out!r}"
+        )
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off"])
+    def test_verbose_false_suppresses_followup(self, value, tmp_path):
+        env = {"MEMPAL_SAVE_INTERVAL": "1", "MEMPAL_VERBOSE": value}
+        out, _ = _run_hook(SAVE_HOOK, _stop_payload(), tmp_path, extra_env=env)
+        assert json.loads(out) == {}, (
+            f"MEMPAL_VERBOSE={value!r} must suppress the followup; got {out!r}"
+        )
+
+    def test_silenced_followup_still_increments_counter(self, tmp_path):
+        """Silence must not disable bookkeeping — the counter still
+        advances so cadence is preserved if the user re-enables."""
+        env = {"MEMPAL_SAVE_INTERVAL": "5", "MEMPAL_CURSOR_SILENT": "1"}
+        for _ in range(2):
+            _run_hook(SAVE_HOOK, _stop_payload(conv="conv-S"), tmp_path, extra_env=env)
+        counter = _state_dir(tmp_path) / "cursor_conv-S.count"
+        assert counter.exists() and counter.read_text().strip() == "2", (
+            "silenced followup must still maintain the per-conversation counter"
+        )
+
+    def test_silenced_pending_marker_emits_empty(self, tmp_path):
+        """A consumed pending marker normally forces a followup; under
+        silence it must emit {} but still clear the marker."""
+        env = {"MEMPAL_CURSOR_SILENT": "1"}
+        pending = _state_dir(tmp_path) / "cursor_conv-P.pending"
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.touch()
+        out, _ = _run_hook(SAVE_HOOK, _stop_payload(conv="conv-P"), tmp_path, extra_env=env)
+        assert json.loads(out) == {}
+        assert not pending.exists(), "pending marker must be consumed even when silenced"
+
+
 # ── save hook: loop-prevention ──────────────────────────────────────
 
 
@@ -576,6 +632,134 @@ class TestInferWing:
         # CURSOR_PROJECT_DIR env var when Cursor is launched from
         # PowerShell.
         assert _call_infer_wing(r"C:\Users\me\MyProj") == "myproj"
+
+
+# ── state-file TTL + GC ─────────────────────────────────────────────
+
+
+def _run_common_snippet(snippet: str, home: Path, *, extra_env: dict | None = None) -> str:
+    """Source common.sh and run a bash snippet against a sandboxed HOME.
+
+    Returns stdout. Used to exercise mempal_state_ttl_days /
+    mempal_gc_stale_state directly without going through a full hook.
+    """
+    script = f'. "{COMMON_LIB}" >/dev/null 2>&1; {snippet}'
+    env = {
+        "HOME": str(home),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "MEMPAL_PYTHON": sys.executable,
+    }
+    if extra_env:
+        env.update(extra_env)
+    p = subprocess.run(
+        ["bash", "-c", script, "_test"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+    assert p.returncode == 0, f"snippet failed: {p.stderr!r}"
+    return p.stdout
+
+
+def _age_file(path: Path, days: int) -> None:
+    old = time.time() - days * 86400
+    os.utime(path, (old, old))
+
+
+class TestStateTtlDays:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("", "30"),
+            ("abc", "30"),
+            ("45", "45"),
+            ("08", "8"),
+            ("007", "7"),
+            ("0", "0"),
+        ],
+    )
+    def test_ttl_validation_and_octal_strip(self, value, expected, tmp_path):
+        out = _run_common_snippet(
+            "mempal_state_ttl_days",
+            tmp_path,
+            extra_env={"MEMPAL_STATE_TTL_DAYS": value} if value != "" else {},
+        )
+        assert out.strip() == expected, (
+            f"MEMPAL_STATE_TTL_DAYS={value!r} should resolve to {expected!r}; got {out.strip()!r}"
+        )
+
+    def test_ttl_default_when_unset(self, tmp_path):
+        assert _run_common_snippet("mempal_state_ttl_days", tmp_path).strip() == "30"
+
+
+class TestStateGc:
+    def test_removes_stale_count_and_pending(self, tmp_path):
+        sd = _state_dir(tmp_path)
+        sd.mkdir(parents=True, exist_ok=True)
+        stale_count = sd / "cursor_old.count"
+        stale_pending = sd / "cursor_old.pending"
+        fresh_count = sd / "cursor_new.count"
+        for f in (stale_count, stale_pending, fresh_count):
+            f.write_text("1")
+        _age_file(stale_count, 40)
+        _age_file(stale_pending, 40)
+        _run_common_snippet("mempal_gc_stale_state", tmp_path)
+        assert not stale_count.exists(), "stale .count older than TTL must be swept"
+        assert not stale_pending.exists(), "stale .pending older than TTL must be swept"
+        assert fresh_count.exists(), "recent state must be preserved"
+
+    def test_preserves_shared_logs_and_other_editor_state(self, tmp_path):
+        sd = _state_dir(tmp_path)
+        sd.mkdir(parents=True, exist_ok=True)
+        # Shared logs + another editor's state, all aged well past the TTL.
+        keep = [
+            sd / "cursor_hook.log",
+            sd / "cursor_last_input.log",
+            sd / "cursor_last_python_err.log",
+            sd / "antigravity_save_count_xyz",
+            sd / "hook.log",
+        ]
+        for f in keep:
+            f.write_text("x")
+            _age_file(f, 99)
+        _run_common_snippet("mempal_gc_stale_state", tmp_path)
+        for f in keep:
+            assert f.exists(), f"GC must never touch {f.name}"
+
+    def test_creates_sweep_marker(self, tmp_path):
+        _run_common_snippet("mempal_gc_stale_state", tmp_path)
+        assert (_state_dir(tmp_path) / "cursor_last_sweep").exists()
+
+    def test_throttled_within_24h(self, tmp_path):
+        sd = _state_dir(tmp_path)
+        sd.mkdir(parents=True, exist_ok=True)
+        # A fresh sweep marker must suppress a second sweep, so a stale
+        # file created afterwards survives until the throttle expires.
+        (sd / "cursor_last_sweep").write_text("")
+        stale = sd / "cursor_old.count"
+        stale.write_text("1")
+        _age_file(stale, 40)
+        _run_common_snippet("mempal_gc_stale_state", tmp_path)
+        assert stale.exists(), "GC must be throttled when last_sweep is recent"
+
+    def test_gc_gated_by_kill_switch(self, tmp_path):
+        """A disabled hook must not sweep (or even create the marker)."""
+        sd = _state_dir(tmp_path)
+        sd.mkdir(parents=True, exist_ok=True)
+        stale = sd / "cursor_zombie.count"
+        stale.write_text("1")
+        _age_file(stale, 40)
+        _run_hook(
+            SAVE_HOOK,
+            _stop_payload(),
+            tmp_path,
+            extra_env={"MEMPAL_DISABLE_HOOK": "1"},
+        )
+        assert stale.exists(), "disabled hook must not GC state"
+        assert not (sd / "cursor_last_sweep").exists(), (
+            "disabled hook must not even create the sweep marker"
+        )
 
 
 # ── logging discipline ─────────────────────────────────────────────

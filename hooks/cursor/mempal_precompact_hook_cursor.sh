@@ -12,15 +12,20 @@
 # and force a save before compaction proceeds), the Cursor preCompact
 # hook can only do two useful things at this moment:
 #
-#   1. Run `mempalace mine` SYNCHRONOUSLY against the transcript file.
-#      The verbatim drawers land in the palace BEFORE Cursor
-#      summarises the conversation. This is the actual data-loss
-#      protection — zero LLM cost, no agent interaction needed.
+#   1. Run `mempalace mine` SYNCHRONOUSLY against the transcript file
+#      so whatever Cursor's transcript contains is ingested BEFORE
+#      Cursor summarises the conversation — zero LLM cost, no agent
+#      interaction needed. NOTE: this is BEST-EFFORT for Cursor.
+#      Cursor's transcript format is undocumented and normalize.py has
+#      no Cursor parser, so this does not yet produce clean verbatim
+#      drawers; it is a safety net, not the primary capture path.
 #
 #   2. Drop a `.pending` marker file keyed on conversation_id. The
 #      next `stop` hook reads that marker and forces a save followup
 #      regardless of its counter, so the AI still gets a "write a
-#      diary entry now" nudge on the very next turn.
+#      diary entry now" nudge on the very next turn. THIS followup is
+#      the load-bearing verbatim-capture path for Cursor (the agent
+#      files its own in-context verbatim quotes via the MCP tools).
 #
 # === INSTALL ===
 #
@@ -52,6 +57,10 @@ if mempal_is_disabled; then
     exit 0
 fi
 
+# Opportunistic, daily-throttled GC of stale per-conversation state.
+# Placed after the kill switch so a disabled hook touches nothing.
+mempal_gc_stale_state
+
 INPUT="$(cat)"
 mempal_parse_stdin "$INPUT"
 
@@ -66,10 +75,23 @@ mempal_log "preCompact" "$MEMPAL_CONV_ID" \
 
 # ── Synchronous mine ──────────────────────────────────────────────
 #
-# This intentionally blocks the hook (within Cursor's per-hook
-# timeout). Compaction is irreversible — once Cursor summarises the
-# conversation we cannot get the verbatim text back. Background-mining
-# would race the compaction.
+# This intentionally blocks the hook. Compaction is irreversible —
+# once Cursor summarises the conversation we cannot get the verbatim
+# text back — so we must finish ingesting before returning. Background
+# mining would race the compaction and lose data.
+#
+# TIMEOUT TRADEOFF (igorls review, PR #1632): on a very large transcript
+# this synchronous mine can exceed Cursor's per-hook timeout, in which
+# case Cursor kills the process mid-mine. That is acceptable and safe
+# here: `mempalace mine` is incremental and append-only (a crash mid-
+# operation leaves the existing palace untouched — see CLAUDE.md
+# "Incremental only"), so a killed mine simply resumes on the next mine
+# invocation rather than corrupting the palace. We deliberately do NOT
+# wrap this in a shorter timeout, because truncating the mine would
+# trade a recoverable partial-ingest for guaranteed silent data loss
+# right before the irreversible compaction. The pending-save marker
+# below is the backstop: the next `stop` hook re-mines and nudges a
+# verbatim save regardless of whether this mine completed.
 if command -v mempalace >/dev/null 2>&1; then
     if mempal_is_valid_transcript "$MEMPAL_TRANSCRIPT" \
         && [ -f "$MEMPAL_TRANSCRIPT" ]; then

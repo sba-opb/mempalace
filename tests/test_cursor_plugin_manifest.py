@@ -137,22 +137,30 @@ class TestPluginManifest:
         assert isinstance(author, dict) and isinstance(author.get("name"), str)
         assert author["name"], "author.name must be non-empty"
 
-    def test_manifest_version_matches_package_version(self):
-        """plugin.json::version must track the installed package version
-        so users can tell at a glance which mempalace they're getting.
+    def test_manifest_omits_hardcoded_version(self):
+        """plugin.json must NOT hardcode a ``version`` field.
 
-        The package version lives in ``mempalace/version.py`` as the
-        single source of truth (per CLAUDE.md). When we bump there, we
-        bump here; otherwise the plugin says one thing and `pip show`
-        says another, and bug reports become harder to triage.
+        ``mempalace/version.py`` is the single source of truth (per
+        CLAUDE.md). A hardcoded version here silently drifts on the next
+        release (igorls review, PR #1632). The sibling Antigravity plugin
+        omits the field entirely; we match that. The marketplace resolves
+        the package version at publish time.
         """
-        from mempalace.version import __version__ as pkg_version
-
         data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-        assert data.get("version") == pkg_version, (
-            f"plugin.json version ({data.get('version')!r}) must match "
-            f"mempalace.version.__version__ ({pkg_version!r})"
+        assert "version" not in data, (
+            "plugin.json must omit the hardcoded 'version' field to avoid "
+            f"drift from mempalace/version.py; found {data.get('version')!r}"
         )
+
+    def test_marketplace_entry_omits_hardcoded_version(self):
+        """Same drift guard for the marketplace plugin entry."""
+        data = json.loads(MARKETPLACE_PATH.read_text(encoding="utf-8"))
+        for plugin in data.get("plugins", []):
+            if isinstance(plugin, dict):
+                assert "version" not in plugin, (
+                    "marketplace.json plugin entry must omit the hardcoded "
+                    f"'version' field; found {plugin.get('version')!r}"
+                )
 
     @pytest.mark.parametrize("field", ["skills", "commands", "mcpServers"])
     def test_manifest_component_paths_are_safe(self, field: str):
@@ -355,6 +363,20 @@ class TestDefaultDiscoveryLayout:
             "mcp.json must be a real file, not a symlink — "
             "Cursor does not follow symlinks for local-plugin discovery"
         )
+
+    def test_no_symlinks_under_cursor_plugin_dir(self):
+        """No path under ``.cursor-plugin/`` may be a symlink.
+
+        igorls review (PR #1632): committed symlinks materialise as plain
+        text files containing the link target on Windows clones with
+        ``core.symlinks=false``, silently breaking the plugin. CI's
+        manifest tests skip Windows, so this guard runs on every platform.
+        The canonical components live at the repo root (``source: "."``);
+        the old ``.cursor-plugin/{commands,skills}`` convenience symlinks
+        were redundant and have been removed.
+        """
+        offenders = [p for p in PLUGIN_DIR.rglob("*") if p.is_symlink()]
+        assert not offenders, f"Symlinks under .cursor-plugin/ break Windows clones: {offenders}"
 
 
 class TestCommands:
