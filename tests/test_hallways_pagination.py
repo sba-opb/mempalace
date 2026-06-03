@@ -25,9 +25,13 @@ def _collection_that_rejects_where_get(drawers):
     col.count.return_value = len(drawers)
 
     def _get(limit=None, offset=0, include=None, where=None, ids=None, **kw):
-        if where is not None:
+        if where is not None and limit is None:
             raise RuntimeError("Error executing plan: too many SQL variables")
-        page = drawers[offset : offset + limit] if limit is not None else drawers
+        filtered_drawers = drawers
+        if where and "wing" in where:
+            target_wing = where["wing"]
+            filtered_drawers = [d for d in drawers if isinstance(d, dict) and d.get("wing") == target_wing]
+        page = filtered_drawers[offset : offset + limit] if limit is not None else filtered_drawers
         return {
             "ids": [f"d{i}" for i in range(offset, offset + len(page))],
             "metadatas": page,
