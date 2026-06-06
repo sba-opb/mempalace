@@ -18,6 +18,19 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return [list(v) for v in vectors]
 
 
+def _as_list(value):
+    """Normalize ChromaDB's ``OneOrMany`` shape (``str`` | sequence) to a list.
+
+    A bare ``str`` must be *wrapped*, not iterated: ``list("abc")`` yields
+    ``['a', 'b', 'c']``, which would embed per character and break length
+    alignment with ``ids``/``metadatas`` on explicit-vector backends
+    (pgvector, sqlite_exact). See PR #1706 review.
+    """
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
 class EmbeddingCollection(BaseCollection):
     """Wrap a collection that requires explicit vectors.
 
@@ -33,8 +46,9 @@ class EmbeddingCollection(BaseCollection):
         return getattr(self._inner, name)
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
+        documents = _as_list(documents)
         if embeddings is None:
-            embeddings = _embed_texts(list(documents))
+            embeddings = _embed_texts(documents)
         return self._inner.add(
             documents=documents,
             ids=ids,
@@ -43,8 +57,9 @@ class EmbeddingCollection(BaseCollection):
         )
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
+        documents = _as_list(documents)
         if embeddings is None:
-            embeddings = _embed_texts(list(documents))
+            embeddings = _embed_texts(documents)
         return self._inner.upsert(
             documents=documents,
             ids=ids,
@@ -63,7 +78,7 @@ class EmbeddingCollection(BaseCollection):
         include: Optional[list[str]] = None,
     ):
         if query_texts is not None and query_embeddings is None:
-            query_embeddings = _embed_texts(list(query_texts))
+            query_embeddings = _embed_texts(_as_list(query_texts))
             query_texts = None
         return self._inner.query(
             query_texts=query_texts,
@@ -105,8 +120,10 @@ class EmbeddingCollection(BaseCollection):
         return self._inner.lexical_search(query=query, n_results=n_results, where=where)
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
-        if documents is not None and embeddings is None:
-            embeddings = _embed_texts(list(documents))
+        if documents is not None:
+            documents = _as_list(documents)
+            if embeddings is None:
+                embeddings = _embed_texts(documents)
         return self._inner.update(
             ids=ids,
             documents=documents,
