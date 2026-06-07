@@ -156,6 +156,21 @@ _init_logging()
 logger = logging.getLogger("mempalace_mcp")
 
 
+def _get_result_ids(result) -> list:
+    """Return ``get()`` result ids for both typed and dict-like collection results."""
+    if result is None:
+        return []
+    ids = getattr(result, "ids", None)
+    if ids is not None:
+        return ids
+    if isinstance(result, dict):
+        return result.get("ids", [])
+    getter = getattr(result, "get", None)
+    if callable(getter):
+        return getter("ids", [])
+    return []
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description="MemPalace MCP Server")
     parser.add_argument(
@@ -1435,10 +1450,11 @@ def tool_add_drawer(
         idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{last_chunk_idx:06d}"]
     try:
         existing = col.get(ids=idempotency_probe_ids, include=[])
-        if existing.ids:
+        if _get_result_ids(existing):
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
-    except Exception:
-        logger.debug("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
+    except Exception as e:
+        logger.warning("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
+        return {"success": False, "error": f"Idempotency check failed before write: {e}"}
 
     try:
         if len(content) <= chunk_size:
@@ -1448,7 +1464,7 @@ def tool_add_drawer(
                 metadatas=[{**base_meta, "chunk_index": 0}],
             )
             inserted = col.get(ids=[drawer_id], include=[])
-            if not inserted.ids:
+            if not _get_result_ids(inserted):
                 raise RuntimeError(
                     "Drawer write was acknowledged but the new ID is not readable. "
                     "The palace index may be stale; run reconnect or repair."
@@ -1483,7 +1499,7 @@ def tool_add_drawer(
         # Probe the LAST chunk id, not the first — its presence confirms
         # the whole batch landed, not just the leading row.
         inserted = col.get(ids=[chunk_ids[-1]], include=[])
-        if not inserted.ids:
+        if not _get_result_ids(inserted):
             raise RuntimeError(
                 "Drawer write was acknowledged but the new ID is not readable. "
                 "The palace index may be stale; run reconnect or repair."

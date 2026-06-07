@@ -1192,6 +1192,53 @@ class TestWriteTools:
         assert result2["success"] is True
         assert result2["reason"] == "already_exists"
 
+    def test_add_drawer_returns_failure_when_idempotency_precheck_raises(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.side_effect = RuntimeError("precheck boom")
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is False
+        assert "Idempotency check failed before write" in result["error"]
+        assert "precheck boom" in result["error"]
+
+    def test_add_drawer_does_not_upsert_when_idempotency_precheck_raises(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.side_effect = RuntimeError("precheck boom")
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is False
+        mock_col.upsert.assert_not_called()
+
+    def test_add_drawer_treats_dict_like_precheck_hit_as_already_exists(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": ["existing-drawer"]}
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is True
+        assert result["reason"] == "already_exists"
+        mock_col.upsert.assert_not_called()
+
     def test_add_drawer_fails_when_readback_misses(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
