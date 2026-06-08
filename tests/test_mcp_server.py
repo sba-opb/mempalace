@@ -2001,6 +2001,43 @@ class TestDeleteBySource:
         assert result["success"] is False
         assert "non-empty" in result["error"]
 
+    def test_non_string_source_rejected(self, monkeypatch, config, palace_path, kg):
+        """A non-string source_file must return a clean error, not AttributeError."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source(123, dry_run=False)
+        assert result["success"] is False
+        assert "non-empty" in result["error"]
+
+    def test_matches_after_surrogate_normalization(self, monkeypatch, config, palace_path, kg):
+        """source_file is stripped of lone surrogates on both ingest and delete,
+        so a path that arrived via a cp1252 stdin (#1488) still matches."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import (
+            tool_add_drawer,
+            tool_delete_by_source,
+            tool_status,
+        )
+
+        # Lone low surrogate embedded in the path — add_drawer strips it.
+        raw_source = "noise\udce9_data.jsonl"
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="benchmark noise from a non-ASCII path",
+            source_file=raw_source,
+        )
+        assert tool_status()["total_drawers"] == 1
+
+        # Deleting with the same raw (un-stripped) string must still match.
+        result = tool_delete_by_source(raw_source, dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 1
+        assert tool_status()["total_drawers"] == 0
+
     def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)
         from mempalace.mcp_server import handle_request

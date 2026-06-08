@@ -2081,8 +2081,12 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     ``dry_run=False`` to commit the deletion (irreversible).
     """
     global _metadata_cache
-    if not source_file or not source_file.strip():
+    if not isinstance(source_file, str) or not source_file.strip():
         return {"success": False, "error": "source_file must be a non-empty string"}
+    # Mirror the ingestion-side normalization (tool_add_drawer strips lone
+    # surrogates from source_file before storing) so exact matching still hits
+    # rows mined from non-ASCII paths that arrived via a cp1252 stdin (#1488).
+    source_file = strip_lone_surrogates(source_file)
 
     col = _get_collection()
     if not col:
@@ -2101,11 +2105,15 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     seen = set()
     for meta in metas:
         meta = _safe_meta(meta)
-        key = (meta.get("wing"), meta.get("room"))
+        # Default missing wing/room to "" for consistency with the rest of the
+        # file (drawers are always stored with both, but be defensive).
+        wing = meta.get("wing", "")
+        room = meta.get("room", "")
+        key = (wing, room)
         if key in seen:
             continue
         seen.add(key)
-        sample.append({"wing": meta.get("wing"), "room": meta.get("room")})
+        sample.append({"wing": wing, "room": room})
         if len(sample) >= 5:
             break
 
