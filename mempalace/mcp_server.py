@@ -1701,7 +1701,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 return {"success": False, "error": str(e)}
             # Preserve existing casing when the caller passes a case-only
             # variant (LLM clients often "autocorrect" acronyms like ps5→PS5).
-            if wing.lower() != (old_meta.get("wing") or "").lower():
+            if wing.lower() != str(old_meta.get("wing") or "").lower():
                 new_meta["wing"] = wing
         if room is not None:
             try:
@@ -1710,7 +1710,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 return {"success": False, "error": str(e)}
             # Preserve existing casing when the caller passes a case-only
             # variant (LLM clients often "autocorrect" acronyms like ps5→PS5).
-            if room.lower() != (old_meta.get("room") or "").lower():
+            if room.lower() != str(old_meta.get("room") or "").lower():
                 new_meta["room"] = room
 
         _wal_log(
