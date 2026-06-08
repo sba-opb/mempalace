@@ -1929,6 +1929,103 @@ def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, pa
     assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
+# ── Delete by source (#1722) ────────────────────────────────────────────
+
+
+class TestDeleteBySource:
+    """``tool_delete_by_source`` — bulk cleanup of benchmark/test contamination (#1722)."""
+
+    def _seed(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        # Two drawers from a "benchmark" source, one from real user data.
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="ShareGPT yoga retreat conversation noise number one.",
+            source_file="results_mempal_hybrid_v4_session_1.jsonl",
+        )
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="ShareGPT coding job description noise number two.",
+            source_file="results_mempal_hybrid_v4_session_1.jsonl",
+        )
+        tool_add_drawer(
+            wing="clients",
+            room="webdesign",
+            content="GG Sauna Dachdecker real client memory that must survive.",
+            source_file="notes/clients.md",
+        )
+
+    def test_dry_run_reports_count_without_deleting(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["success"] is True
+        assert result["dry_run"] is True
+        assert result["match_count"] == 2
+        assert {"wing": "bench", "room": "general"} in result["sample"]
+        # Nothing removed — all three drawers still present.
+        assert tool_status()["total_drawers"] == 3
+
+    def test_commit_deletes_only_matching_source(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["dry_run"] is False
+        assert result["deleted"] == 2
+        # Only the real client drawer remains.
+        assert tool_status()["total_drawers"] == 1
+
+    def test_no_match_is_idempotent_not_error(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("does/not/exist.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 0
+        assert tool_status()["total_drawers"] == 3
+
+    def test_empty_source_file_rejected(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("   ", dry_run=False)
+        assert result["success"] is False
+        assert "non-empty" in result["error"]
+
+    def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import handle_request
+
+        # Listed in tools/list
+        listed = handle_request({"method": "tools/list", "id": 1, "params": {}})
+        names = {t["name"] for t in listed["result"]["tools"]}
+        assert "mempalace_delete_by_source" in names
+
+        # Dispatches and defaults to dry-run (no destructive side effect)
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_delete_by_source",
+                    "arguments": {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                },
+            }
+        )
+        content = json.loads(resp["result"]["content"][0]["text"])
+        assert content["dry_run"] is True
+        assert content["match_count"] == 2
+
+
 # ── KG Tools ────────────────────────────────────────────────────────────
 
 

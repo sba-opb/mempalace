@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 33 MCP tools.
+Detailed parameter schemas for all 34 MCP tools.
 
 ## Palace — Read Tools
 
@@ -129,6 +129,20 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wra
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+
+---
+
+### `mempalace_delete_by_source`
+
+Bulk-delete every drawer mined from one `source_file` (exact match). Use this to clean up benchmark or test data that was accidentally mined into a user wing — for example ShareGPT dumps or `results_mempal_*.jsonl` eval files drowning out real memories in semantic search. Matching is pushed down to the storage backend via a `where` filter, so it is not subject to the SQLite variable limit no matter how many drawers share the source. Returns a dry-run match count and a small sample by default; pass `dry_run=false` to commit. Irreversible.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_file` | string | **Yes** | Exact `source_file` metadata value to remove (e.g. the full path that was mined) |
+| `dry_run` | boolean | No | Preview the match count without deleting; default `true`. Pass `false` to actually delete |
+
+**Returns (dry run):** `{ success, dry_run, source_file, match_count, sample, hint }`
+**Returns (commit):** `{ success, dry_run, source_file, deleted }`
 
 ---
 
