@@ -352,6 +352,30 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+# Session-level advisory-lock namespace for serializing HNSW index builds
+# across daemon writers (RFC 001). classid is a fixed mempalace constant
+# ("MEMP" in ASCII); objid is a stable per-table key. Both must fit a signed
+# int4, which ``pg_advisory_lock(int4, int4)`` requires.
+_MAINTENANCE_LOCK_CLASSID = 0x4D454D50  # "MEMP" — a positive, valid int4
+
+
+def _advisory_objid(table: str) -> int:
+    """Stable signed-int4 advisory key derived from the table name."""
+    raw = int(sha256(table.encode("utf-8")).hexdigest()[:8], 16)  # 0 .. 2**32-1
+    return raw - 2**32 if raw >= 2**31 else raw
+
+
+def _hnsw_index_name(table: str) -> str:
+    """Deterministic, collision-safe index name for ``table``.
+
+    Routes through :func:`_pg_identifier`, which hashes the overflow when the
+    name exceeds Postgres' 63-byte limit. A naive ``[:63]`` truncation could
+    return the table name verbatim (tables and indexes share the ``pg_class``
+    namespace), which would fail with "relation already exists".
+    """
+    return _pg_identifier(f"{table}_hnsw_idx")
+
+
 def _field_sql(field: str, expression: Any, params: list) -> str:
     """Translate one field predicate to a JSONB containment expression."""
     if isinstance(expression, dict):
@@ -624,6 +648,39 @@ class _PgVectorClient:
 
     def drop_table(self, table: str) -> None:
         self._execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
+
+    # ------------------------------------------------------------------
+    # Maintenance (RFC 001)
+    # ------------------------------------------------------------------
+    def has_vector_index(self, table: str) -> bool:
+        rows = self._execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() "
+            "AND tablename = %s AND indexdef ILIKE %s",
+            [table, "%using hnsw%"],
+            fetch=True,
+        )
+        return bool(rows)
+
+    def try_advisory_lock(self, classid: int, objid: int) -> bool:
+        rows = self._execute("SELECT pg_try_advisory_lock(%s, %s)", [classid, objid], fetch=True)
+        return bool(rows and rows[0] and rows[0][0])
+
+    def advisory_unlock(self, classid: int, objid: int) -> None:
+        self._execute("SELECT pg_advisory_unlock(%s, %s)", [classid, objid], fetch=True)
+
+    def create_hnsw_index(self, table: str) -> None:
+        qi = _quote_identifier(table)
+        idx = _quote_identifier(_hnsw_index_name(table))
+        # Non-concurrent build takes ACCESS EXCLUSIVE for the build duration;
+        # the advisory lock in the caller ensures only one session builds, so
+        # writes are blocked once rather than by every writer that crossed the
+        # threshold (the production wedge this serialization fixes).
+        self._execute(
+            f"CREATE INDEX IF NOT EXISTS {idx} ON {qi} USING hnsw (embedding vector_cosine_ops)"
+        )
+
+    def analyze_table(self, table: str) -> None:
+        self._execute(f"ANALYZE {_quote_identifier(table)}")
 
     def close(self) -> None:
         with self._lock:
@@ -1014,6 +1071,60 @@ class PgVectorCollection(BaseCollection):
             return HealthStatus.unhealthy(str(exc))
         return HealthStatus.healthy()
 
+    def maintenance_state(self) -> dict:
+        empty = {"row_count": 0, "vector_index": None, "index_build_complete": False}
+        self._ensure_open()
+        try:
+            if not self._table_exists():
+                return empty
+            rows = self._client.count_rows(self._table)
+            has_index = self._client.has_vector_index(self._table)
+        except Exception:  # noqa: BLE001 - state report must not raise
+            logger.debug("pgvector maintenance state probe failed", exc_info=True)
+            return empty
+        return {
+            "row_count": rows,
+            "vector_index": "hnsw" if has_index else None,
+            "index_build_complete": has_index,
+        }
+
+    def run_maintenance(self, kind: str):
+        from .base import MaintenanceResult, UnsupportedMaintenanceKindError
+
+        if kind not in PgVectorBackend.maintenance_kinds:
+            raise UnsupportedMaintenanceKindError(
+                f"pgvector does not support maintenance kind {kind!r}"
+            )
+        self._ensure_open()
+        # Nothing to maintain on a not-yet-materialized table (collection opened
+        # create=True but never written) — return noop rather than letting a
+        # raw "relation does not exist" error escape.
+        if not self._table_exists():
+            return MaintenanceResult(kind=kind, status="noop", stats={"reason": "no table"})
+        if kind == "analyze":
+            self._client.analyze_table(self._table)
+            return MaintenanceResult(kind="analyze", status="ran")
+
+        # reindex → build the optional HNSW index. Opt-in: it makes search
+        # approximate, trading the exact-scan 100%-recall default for scale.
+        # Serialized with a session advisory lock so concurrent daemon writers
+        # learn "already_running" instead of each stacking an ACCESS EXCLUSIVE
+        # index build.
+        if self._client.has_vector_index(self._table):
+            return MaintenanceResult(kind="reindex", status="noop", stats={"vector_index": "hnsw"})
+        classid, objid = _MAINTENANCE_LOCK_CLASSID, _advisory_objid(self._table)
+        if not self._client.try_advisory_lock(classid, objid):
+            return MaintenanceResult(kind="reindex", status="already_running")
+        try:
+            if self._client.has_vector_index(self._table):  # re-check under lock
+                return MaintenanceResult(
+                    kind="reindex", status="noop", stats={"vector_index": "hnsw"}
+                )
+            self._client.create_hnsw_index(self._table)
+            return MaintenanceResult(kind="reindex", status="ran", stats={"vector_index": "hnsw"})
+        finally:
+            self._client.advisory_unlock(classid, objid)
+
 
 class PgVectorBackend(BaseBackend):
     name = "pgvector"
@@ -1026,9 +1137,15 @@ class PgVectorBackend(BaseBackend):
             "supports_metadata_filters",
             "supports_lexical_search",
             "supports_namespace_isolation",
+            "supports_server_side_indexes",
             "server_mode",
         }
     )
+    # "compact" is omitted: Postgres autovacuum reclaims space automatically,
+    # so a manual VACUUM kind would be redundant. "reindex" builds the optional
+    # HNSW index — an opt-in scale lever, NOT on by default, because it makes
+    # vector search approximate (the exact ``<=>`` scan is the 100%-recall path).
+    maintenance_kinds = frozenset({"analyze", "reindex"})
 
     def __init__(self):
         self._clients: dict[_PgVectorConfig, _PgVectorClient] = {}

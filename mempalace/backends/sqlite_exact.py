@@ -740,6 +740,63 @@ class SQLiteExactCollection(BaseCollection):
             return HealthStatus.unhealthy("collection closed")
         return HealthStatus.healthy()
 
+    def maintenance_state(self) -> dict:
+        try:
+            rows = self.count()
+        except Exception:
+            rows = 0
+        # vector_index is null by design — exact cosine over every row, no ANN.
+        state = {"row_count": rows, "vector_index": None}
+        try:
+            with self._cursor() as cur:
+                page_count = cur.execute("PRAGMA page_count").fetchone()
+                freelist = cur.execute("PRAGMA freelist_count").fetchone()
+            state["page_count"] = int(page_count[0]) if page_count else 0
+            state["freelist_pages"] = int(freelist[0]) if freelist else 0
+        except Exception:
+            pass
+        return state
+
+    def run_maintenance(self, kind: str):
+        from .base import MaintenanceResult, UnsupportedMaintenanceKindError
+
+        if kind not in SQLiteExactBackend.maintenance_kinds:
+            raise UnsupportedMaintenanceKindError(
+                f"sqlite_exact does not support maintenance kind {kind!r}"
+            )
+        if kind == "analyze":
+            # Refresh planner stats. Concurrent runs serialize on the handle lock.
+            with self._cursor() as cur:
+                cur.execute("ANALYZE")
+            return MaintenanceResult(kind="analyze", status="ran")
+
+        # compact → VACUUM. It cannot run inside a transaction, so flip the
+        # connection to autocommit for the duration. The handle lock serializes
+        # concurrent runs in-process; SQLite's own write lock serializes across
+        # processes.
+        before = self.maintenance_state()
+        with self._handle.lock:
+            self._ensure_open()
+            conn = self._handle.conn
+            prev_isolation = conn.isolation_level
+            try:
+                conn.commit()
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+            finally:
+                conn.isolation_level = prev_isolation
+        after = self.maintenance_state()
+        reclaimed = max(0, before.get("page_count", 0) - after.get("page_count", 0))
+        return MaintenanceResult(
+            kind="compact",
+            status="ran",
+            stats={
+                "pages_before": before.get("page_count", 0),
+                "pages_after": after.get("page_count", 0),
+                "pages_reclaimed": reclaimed,
+            },
+        )
+
 
 class SQLiteExactBackend(BaseBackend):
     name = "sqlite_exact"
@@ -754,6 +811,9 @@ class SQLiteExactBackend(BaseBackend):
             "local_mode",
         }
     )
+    # "reindex" is intentionally omitted: sqlite_exact does exact cosine over
+    # every row (no ANN index to build), so it has no analogue for it.
+    maintenance_kinds = frozenset({"analyze", "compact"})
 
     def __init__(self):
         self._clients: dict[str, _SQLiteExactHandle] = {}

@@ -14,7 +14,7 @@ conformance suite land in follow-up PRs.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Protocol, runtime_checkable
 
 
@@ -60,6 +60,15 @@ class UnsupportedFilterError(BackendError):
 
 class UnsupportedCapabilityError(BackendError):
     """Raised when a backend does not implement an optional capability."""
+
+
+class UnsupportedMaintenanceKindError(BackendError):
+    """Raised when ``run_maintenance(kind)`` is called with an unadvertised kind.
+
+    A backend MUST advertise a kind in ``maintenance_kinds`` before it accepts
+    it (RFC 001). Advertising a kind it does not implement is a conformance
+    failure; a kind it has no analogue for MUST be omitted, not no-op'd.
+    """
 
 
 class BackendMismatchError(BackendError):
@@ -138,6 +147,29 @@ class EmbedderIdentity:
 
     model_name: str
     dimension: int = 0
+
+
+@dataclass(frozen=True)
+class MaintenanceResult:
+    """Observable outcome of ``run_maintenance(kind)`` (RFC 001).
+
+    Maintenance is *not* fire-and-forget: a backend MUST serialize concurrent
+    same-kind runs and report the outcome so a caller can learn it must not
+    re-trigger. ``status`` is one of:
+
+    * ``"ran"`` — this call performed the maintenance.
+    * ``"already_running"`` — another caller holds the work; this call did
+      nothing and the caller MUST NOT re-trigger (the production index-build
+      wedge: concurrent writers each issuing the build stacked exclusive locks).
+    * ``"noop"`` — nothing needed doing (e.g. the index already exists).
+
+    ``stats`` is free-form per kind (rows analyzed, bytes reclaimed, index
+    build time) for benchmark/operator reporting.
+    """
+
+    kind: str
+    status: str
+    stats: dict = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -436,6 +468,27 @@ class BaseCollection(ABC):
         """
         return None
 
+    def maintenance_state(self) -> dict:
+        """Return a structured snapshot of this collection's maintenance state.
+
+        Free-form per backend (e.g. row count, whether a vector index exists,
+        last-analyze age). Used by benchmark harnesses to record state
+        alongside each latency/recall measurement so an un-analyzed store is
+        not compared against a settled one (RFC 001). Defaults to empty.
+        """
+        return {}
+
+    def run_maintenance(self, kind: str) -> "MaintenanceResult":
+        """Run a maintenance ``kind`` and return an observable result (RFC 001).
+
+        Backends advertise supported kinds in ``BaseBackend.maintenance_kinds``
+        and override this. The default supports nothing, so every kind raises
+        :class:`UnsupportedMaintenanceKindError`. Implementations MUST serialize
+        concurrent same-kind runs and report ``already_running`` rather than
+        stacking the work.
+        """
+        raise UnsupportedMaintenanceKindError(f"backend does not support maintenance kind {kind!r}")
+
     def lexical_search(
         self,
         *,
@@ -522,6 +575,14 @@ class BaseBackend(ABC):
     #: search converts distance→similarity off this declaration rather than
     #: assuming cosine. All in-tree backends are cosine today.
     distance_metric: ClassVar[str] = "cosine"
+    #: Maintenance kinds this backend implements (RFC 001). Reserved names:
+    #: ``"analyze"`` (refresh planner/query statistics), ``"compact"`` (reclaim
+    #: space, rewrite storage), ``"reindex"`` (build/rebuild secondary indexes).
+    #: A backend with no analogue for a kind MUST omit it rather than declare a
+    #: no-op, so a benchmark harness can trust the set. Backends MAY add their
+    #: own kinds. ``run_maintenance`` raises ``UnsupportedMaintenanceKindError``
+    #: for anything not listed here.
+    maintenance_kinds: ClassVar[frozenset[str]] = frozenset()
 
     @abstractmethod
     def get_collection(
