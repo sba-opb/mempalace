@@ -119,16 +119,17 @@ def test_chroma_identity_roundtrip_via_sidecar(tmp_path):
     assert os.path.isfile(os.path.join(str(tmp_path), "mempalace_embedder.json"))
 
 
-def test_pgvector_marker_preserves_identity_across_rewrite(tmp_path):
-    # The marker is rebuilt on every collection create; identity must survive.
+def test_pgvector_identity_survives_marker_rewrite(tmp_path):
+    # Identity lives in a sidecar, separate from the mismatch marker, so a
+    # marker rebuild (which happens on every write) must not affect it.
     from mempalace.backends.pgvector import PgVectorBackend, _PgVectorConfig
 
     backend = PgVectorBackend()
     cfg = _PgVectorConfig(dsn="postgresql://example", namespace=None)
     ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
-    backend._write_marker(ref, cfg)
+    # No marker needed to record identity — the sidecar is unguarded.
     backend._set_embedder_identity(ref, "mempalace_drawers", EmbedderIdentity("minilm", 384))
-    backend._write_marker(ref, cfg)  # rebuild must not wipe embedders
+    backend._write_marker(ref, cfg)
     got = backend._get_embedder_identity(ref, "mempalace_drawers")
     assert got is not None and got.model_name == "minilm" and got.dimension == 384
 
@@ -308,3 +309,100 @@ def test_chroma_corrupt_sidecar_returns_none(tmp_path):
     # And a subsequent set still works (overwrites the junk).
     col.set_embedder_identity(EmbedderIdentity("minilm", 384))
     assert col.get_stored_embedder_identity().model_name == "minilm"
+
+
+# ---------------------------------------------------------------------------
+# qdrant: identity persisted in the local marker (no live qdrant needed)
+# ---------------------------------------------------------------------------
+
+
+def _qdrant_collection(tmp_path, *, write_marker=True):
+    from mempalace.backends.qdrant import QdrantBackend, QdrantCollection, _QdrantConfig
+
+    backend = QdrantBackend()
+    config = _QdrantConfig(url="http://localhost:6333", api_key=None, namespace=None)
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    if write_marker:
+        backend._write_marker(ref, config)
+    # The identity methods read/write the local marker only; the client is
+    # never touched, so a placeholder stands in for a live REST connection.
+    return QdrantCollection(
+        backend=backend,
+        client=object(),
+        config=config,
+        palace=ref,
+        collection_name="mempalace_drawers",
+        remote_collection="mp_drawers_remote",
+    )
+
+
+def test_qdrant_identity_survives_marker_rewrite(tmp_path):
+    from mempalace.backends.qdrant import QdrantBackend, _QdrantConfig
+
+    backend = QdrantBackend()
+    config = _QdrantConfig(url="http://localhost:6333", api_key=None, namespace=None)
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    backend._write_marker(ref, config)
+    backend._set_embedder_identity(ref, "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    backend._write_marker(ref, config)  # rebuild must not wipe embedders
+    got = backend._get_embedder_identity(ref, "mempalace_drawers")
+    assert got is not None and got.model_name == "minilm" and got.dimension == 384
+
+
+def test_qdrant_collection_delegates_identity(tmp_path):
+    col = _qdrant_collection(tmp_path)
+    assert col.get_stored_embedder_identity() is None
+    col.set_embedder_identity(EmbedderIdentity("minilm", 384))
+    got = col.get_stored_embedder_identity()
+    assert got is not None and got.model_name == "minilm" and got.dimension == 384
+
+
+def test_qdrant_set_identity_creates_sidecar_when_missing(tmp_path):
+    # Brand-new palace whose first write hasn't created the marker yet:
+    # recording identity must create it, not silently no-op into permanent
+    # "unknown" (the marker-on-write vs record-on-open timing gap).
+    col = _qdrant_collection(tmp_path, write_marker=False)
+    assert not col._marker_exists()
+    col.set_embedder_identity(EmbedderIdentity("minilm", 384))
+    got = col.get_stored_embedder_identity()
+    assert got is not None and got.model_name == "minilm"
+
+
+def _pgvector_collection(tmp_path, *, write_marker=True):
+    from mempalace.backends.pgvector import PgVectorBackend, PgVectorCollection, _PgVectorConfig
+
+    backend = PgVectorBackend()
+    config = _PgVectorConfig(dsn="postgresql://example", namespace=None)
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    if write_marker:
+        backend._write_marker(ref, config)
+    return PgVectorCollection(
+        backend=backend,
+        client=object(),
+        config=config,
+        palace=ref,
+        collection_name="mempalace_drawers",
+        table="mp_drawers_t",
+    )
+
+
+def test_pgvector_set_identity_creates_sidecar_when_missing(tmp_path):
+    # Same brand-new-palace timing gap as qdrant: recording must create the
+    # marker rather than no-op.
+    col = _pgvector_collection(tmp_path, write_marker=False)
+    assert not col._marker_exists()
+    col.set_embedder_identity(EmbedderIdentity("minilm", 384))
+    got = col.get_stored_embedder_identity()
+    assert got is not None and got.model_name == "minilm"
+
+
+def test_qdrant_enforcement_model_swap_raises(tmp_path, monkeypatch, clear_identity_cache):
+    # The enforcement check reads the marker (no server) and compares to the
+    # configured model — a swap raises just like the local backends.
+    from mempalace import palace as P
+
+    col = _qdrant_collection(tmp_path)
+    col.set_embedder_identity(EmbedderIdentity("minilm", 384))
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    with pytest.raises(EmbedderIdentityMismatchError):
+        P._enforce_embedder_identity(col, str(tmp_path), "mempalace_drawers", create=False)

@@ -37,6 +37,7 @@ from urllib import parse as urlparse
 
 import numpy as np
 
+from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
     BackendError,
@@ -747,6 +748,8 @@ class PgVectorCollection(BaseCollection):
         return self._backend._get_embedder_identity(self._palace, self._collection_name)
 
     def set_embedder_identity(self, identity) -> None:
+        # Sidecar-backed (see PgVectorBackend), so this records even on a
+        # brand-new palace whose mismatch marker doesn't exist yet.
         self._backend._set_embedder_identity(self._palace, self._collection_name, identity)
 
     def _ensure_table(self, dimension: int) -> None:
@@ -1255,14 +1258,6 @@ class PgVectorBackend(BaseBackend):
             "palace_id": palace.id,
             "pgvector": self._marker_target(palace, config),
         }
-        # Preserve recorded embedder identities across marker rewrites — a
-        # rebuilt marker must not wipe per-collection model-name tracking.
-        try:
-            existing = self._read_marker(palace)
-        except BackendMismatchError:
-            existing = None
-        if isinstance(existing, dict) and isinstance(existing.get("embedders"), dict):
-            marker["embedders"] = existing["embedders"]
         marker_path = self._marker_path(palace.local_path)
         with open(marker_path, "w", encoding="utf-8") as f:
             json.dump(marker, f, indent=2, ensure_ascii=False)
@@ -1270,51 +1265,23 @@ class PgVectorBackend(BaseBackend):
             os.chmod(marker_path, 0o600)
         except (OSError, NotImplementedError):
             pass
+
+    # Embedder identity lives in a sidecar, NOT the backend marker: the marker's
+    # presence signals "palace initialized" (reads raise CollectionNotInitialized
+    # when the marker exists but the remote table doesn't), so recording identity
+    # at first empty open must not create it. The sidecar is unguarded — like the
+    # chroma sidecar — so a brand-new palace can record identity immediately.
+    @staticmethod
+    def _embedder_sidecar_path(palace: PalaceRef) -> Optional[str]:
+        if not palace.local_path:
+            return None
+        return os.path.join(palace.local_path, EMBEDDER_SIDECAR_FILENAME)
 
     def _get_embedder_identity(self, palace: PalaceRef, collection_name: str):
-        from .base import EmbedderIdentity
-
-        try:
-            marker = self._read_marker(palace)
-        except BackendMismatchError:
-            return None
-        if not isinstance(marker, dict):
-            return None
-        embedders = marker.get("embedders")
-        if not isinstance(embedders, dict):
-            return None
-        entry = embedders.get(collection_name)
-        if not isinstance(entry, dict) or not entry.get("model_name"):
-            return None
-        return EmbedderIdentity(
-            model_name=str(entry["model_name"]),
-            dimension=int(entry.get("dimension") or 0),
-        )
+        return read_embedder_sidecar(self._embedder_sidecar_path(palace), collection_name)
 
     def _set_embedder_identity(self, palace: PalaceRef, collection_name: str, identity) -> None:
-        if not palace.local_path or not identity or not identity.model_name:
-            return
-        marker_path = self._marker_path(palace.local_path)
-        if not os.path.isfile(marker_path):
-            return
-        try:
-            marker = self._read_marker(palace) or {}
-        except BackendMismatchError:
-            return
-        embedders = marker.get("embedders")
-        if not isinstance(embedders, dict):
-            embedders = {}
-        embedders[collection_name] = {
-            "model_name": str(identity.model_name),
-            "dimension": int(identity.dimension or 0),
-        }
-        marker["embedders"] = embedders
-        with open(marker_path, "w", encoding="utf-8") as f:
-            json.dump(marker, f, indent=2, ensure_ascii=False)
-        try:
-            os.chmod(marker_path, 0o600)
-        except (OSError, NotImplementedError):
-            pass
+        write_embedder_sidecar(self._embedder_sidecar_path(palace), collection_name, identity)
 
     # ------------------------------------------------------------------
     def _client(self, config: _PgVectorConfig) -> _PgVectorClient:
