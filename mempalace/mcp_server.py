@@ -88,6 +88,10 @@ from .palace_graph import (  # noqa: E402
     delete_tunnel,
     follow_tunnels,
 )
+from .hallways import (  # noqa: E402
+    list_hallways,
+    delete_hallway,
+)
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
@@ -1352,6 +1356,22 @@ def tool_delete_tunnel(tunnel_id: str):
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
     return delete_tunnel(tunnel_id)
+
+
+def tool_list_hallways(wing: str = None):
+    """List within-wing hallway records, optionally filtered by wing."""
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+    except ValueError as e:
+        return {"error": str(e)}
+    return list_hallways(wing)
+
+
+def tool_delete_hallway(hallway_id: str):
+    """Delete a hallway record by its ID."""
+    if not hallway_id or not isinstance(hallway_id, str):
+        return {"error": "hallway_id is required"}
+    return {"deleted": delete_hallway(hallway_id)}
 
 
 def tool_follow_tunnels(wing: str, room: str):
@@ -2683,6 +2703,30 @@ TOOLS = {
             "required": ["tunnel_id"],
         },
         "handler": tool_delete_tunnel,
+    },
+    "mempalace_list_hallways": {
+        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Filter hallways by wing",
+                },
+            },
+        },
+        "handler": tool_list_hallways,
+    },
+    "mempalace_delete_hallway": {
+        "description": "Delete a hallway record by its ID. Returns {deleted: bool}.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hallway_id": {"type": "string", "description": "Hallway ID to delete"},
+            },
+            "required": ["hallway_id"],
+        },
+        "handler": tool_delete_hallway,
     },
     "mempalace_follow_tunnels": {
         "description": "Follow tunnels from a room to see what it connects to in other wings. Returns connected rooms with drawer previews.",

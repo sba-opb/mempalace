@@ -1512,6 +1512,108 @@ class TestWriteTools:
 
         assert result == {"error": msg}
 
+    # ── hallway MCP tools (mirror the tunnel pattern) ──
+
+    def _seed_hallways(self, monkeypatch, tmp_path):
+        """Point hallways._HALLWAY_FILE at a tmp file and seed two records."""
+        from mempalace import hallways
+
+        hallway_file = tmp_path / "hallways.json"
+        monkeypatch.setattr(hallways, "_HALLWAY_FILE", str(hallway_file))
+        seeded = [
+            {
+                "id": "hallway_wing_a_X_Y_aaaa",
+                "wing": "wing_a",
+                "entity_a": "X",
+                "entity_b": "Y",
+                "co_occurrence_count": 3,
+                "rooms": ["room1"],
+            },
+            {
+                "id": "hallway_wing_b_X_Z_bbbb",
+                "wing": "wing_b",
+                "entity_a": "X",
+                "entity_b": "Z",
+                "co_occurrence_count": 1,
+                "rooms": ["room2"],
+            },
+        ]
+        hallways._save_hallways(seeded)
+        return seeded
+
+    def test_tool_list_hallways_returns_all_without_filter(self, monkeypatch, tmp_path):
+        """tool_list_hallways with no wing returns every record."""
+        from mempalace import mcp_server
+
+        seeded = self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_list_hallways()
+        assert isinstance(result, list)
+        assert len(result) == len(seeded)
+        ids = {h["id"] for h in result}
+        assert ids == {h["id"] for h in seeded}
+
+    def test_tool_list_hallways_filters_by_wing(self, monkeypatch, tmp_path):
+        """tool_list_hallways with wing returns only that wing's records."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_list_hallways(wing="wing_a")
+        assert len(result) == 1
+        assert result[0]["wing"] == "wing_a"
+
+    def test_tool_list_hallways_rejects_invalid_wing_name(self, monkeypatch, tmp_path):
+        """Invalid wing names go through _sanitize_optional_name and return a
+        structured error rather than crashing — mirrors tool_list_tunnels."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        # Forward-slash is not a valid name character per sanitize_name.
+        result = mcp_server.tool_list_hallways(wing="wing/with/slashes")
+        assert isinstance(result, dict)
+        assert "error" in result
+
+    def test_tool_delete_hallway_removes_existing_record(self, monkeypatch, tmp_path):
+        """tool_delete_hallway removes the record and returns {deleted: True}."""
+        from mempalace import mcp_server
+
+        seeded = self._seed_hallways(monkeypatch, tmp_path)
+        target_id = seeded[0]["id"]
+        result = mcp_server.tool_delete_hallway(hallway_id=target_id)
+        assert result == {"deleted": True}
+        remaining = mcp_server.tool_list_hallways()
+        assert target_id not in {h["id"] for h in remaining}
+
+    def test_tool_delete_hallway_unknown_id_returns_false(self, monkeypatch, tmp_path):
+        """Deleting an ID that doesn't exist returns {deleted: False} without error."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_delete_hallway(hallway_id="hallway_does_not_exist")
+        assert result == {"deleted": False}
+
+    def test_tool_delete_hallway_requires_string_id(self):
+        """Missing or non-string hallway_id surfaces a structured error."""
+        from mempalace import mcp_server
+
+        assert mcp_server.tool_delete_hallway(hallway_id="") == {"error": "hallway_id is required"}
+        assert mcp_server.tool_delete_hallway(hallway_id=None) == {
+            "error": "hallway_id is required"
+        }
+
+    def test_hallway_tools_registered_in_tools_registry(self):
+        """Both new tools must appear in the public TOOLS registry so MCP clients can dispatch them."""
+        from mempalace import mcp_server
+
+        assert "mempalace_list_hallways" in mcp_server.TOOLS
+        assert "mempalace_delete_hallway" in mcp_server.TOOLS
+        assert (
+            mcp_server.TOOLS["mempalace_list_hallways"]["handler"] is mcp_server.tool_list_hallways
+        )
+        assert (
+            mcp_server.TOOLS["mempalace_delete_hallway"]["handler"]
+            is mcp_server.tool_delete_hallway
+        )
+
     def test_add_drawer_normal_content_single_drawer(self, monkeypatch, config, palace_path, kg):
         """Regression catch: content below CHUNK_SIZE produces exactly
         one drawer with ``chunks == 1``. Pre-#1539 contract preserved."""
