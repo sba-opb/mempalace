@@ -46,13 +46,11 @@ from .dynamics import initialize_dynamics_fields
 
 logger = logging.getLogger("mempalace_hallways")
 
-# Persistence target. Mirrors ``palace_graph._get_tunnel_file`` (the 3.3.6
-# palace-scoped pattern) so the storage layout is uniform across the two
-# related primitives. Prefer the resolver functions below — the module-level
-# constant is kept only for legacy fallback detection and for tests that still
-# monkey-patch it directly via ``monkeypatch.setattr(hallways,
-# "_HALLWAY_FILE", tmp_path/...)``.
-_HALLWAY_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "hallways.json")
+# Persistence target is resolved through ``_get_hallway_file`` below, which
+# mirrors ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern)
+# so the storage layout is uniform across the two related primitives. Tests
+# should monkey-patch ``_get_hallway_file`` and ``_legacy_hallway_file`` rather
+# than poking a module-level constant.
 
 _SCHEMA_VERSION = 1
 
@@ -97,9 +95,6 @@ def _load_hallways(config=None) -> list[dict]:
     clobbering newer data. Same posture as ``palace_graph._load_tunnels``.
     """
     current_hallway_file = _get_hallway_file(config)
-    # Honor direct monkey-patches of the module constant (used by older tests).
-    if _HALLWAY_FILE != _legacy_hallway_file():
-        current_hallway_file = _HALLWAY_FILE
     if os.path.exists(current_hallway_file):
         try:
             with open(current_hallway_file, encoding="utf-8") as f:
@@ -133,9 +128,6 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
     not want world-readable.
     """
     hallway_file = _get_hallway_file(config)
-    # Honor direct monkey-patches of the module constant (used by older tests).
-    if _HALLWAY_FILE != _legacy_hallway_file():
-        hallway_file = _HALLWAY_FILE
     directory = os.path.dirname(hallway_file)
     os.makedirs(directory, exist_ok=True)
     payload = {

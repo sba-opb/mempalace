@@ -74,7 +74,6 @@ class TestLegacyHallwayFileDetection:
 
         # Point the module constant at the patched-legacy path so the
         # back-compat shim treats it as "legacy, defer to resolver".
-        monkeypatch.setattr(hallways_mod, "_HALLWAY_FILE", str(legacy))
         monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(configured))
         monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(legacy))
 
@@ -90,7 +89,6 @@ class TestLegacyHallwayFileDetection:
         we must not emit a misleading 'legacy file ignored' warning when the
         file simply doesn't exist yet."""
         same = tmp_path / "hallways.json"
-        monkeypatch.setattr(hallways_mod, "_HALLWAY_FILE", str(same))
         monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(same))
         monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(same))
 
@@ -136,7 +134,6 @@ class TestMultiPalaceIsolation:
 
         # Force the module constant to match the (default) legacy path so the
         # back-compat shim doesn't override the resolver.
-        monkeypatch.setattr(hallways_mod, "_HALLWAY_FILE", hallways_mod._legacy_hallway_file())
 
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace_a))
         hallways_mod._save_hallways(
