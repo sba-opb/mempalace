@@ -162,6 +162,101 @@ def test_prefix_is_applied(patched_lazy_load, monkeypatch):
     assert any("raw text one" in t for t in captured)
 
 
+def test_call_chunks_large_batches(patched_lazy_load, monkeypatch):
+    """A large input must be tokenized and run in bounded sub-batches.
+
+    One unchunked session.run over a repair-scale batch (5000 docs) allocates
+    attention buffers beyond available RAM and the kernel kills the process
+    (#1770) — so __call__ may never see more than _EMBEDDINGGEMMA_BATCH_SIZE
+    docs per forward pass.
+    """
+    batch_sizes = []
+    captured_texts = []
+    original_encode_batch = _FakeTokenizer.encode_batch
+
+    def recording_encode_batch(self, texts):
+        batch_sizes.append(len(texts))
+        captured_texts.extend(texts)
+        return original_encode_batch(self, texts)
+
+    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
+    ef = embedding.EmbeddinggemmaONNX()
+    n = embedding._EMBEDDINGGEMMA_BATCH_SIZE * 2 + 6
+    docs = [f"doc {i}" for i in range(n)]
+    out = ef(docs)
+
+    assert batch_sizes == [
+        embedding._EMBEDDINGGEMMA_BATCH_SIZE,
+        embedding._EMBEDDINGGEMMA_BATCH_SIZE,
+        6,
+    ], f"expected bounded sub-batches, got {batch_sizes}"
+    # Sub-batches must cover the input in order; combined with the per-chunk
+    # extend in __call__ this pins output row order to input order.
+    assert captured_texts == [embedding._EMBEDDINGGEMMA_PREFIX + d for d in docs]
+    arr = np.asarray(out)
+    assert arr.shape == (n, 384), f"chunked outputs must concatenate to (n, 384), got {arr.shape}"
+    assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=1e-5)
+
+
+_B = 32  # mirrors _EMBEDDINGGEMMA_BATCH_SIZE; literal so the cases read plainly
+
+
+@pytest.mark.parametrize(
+    ("n", "expected_batches"),
+    [
+        (1, [1]),
+        (_B, [_B]),
+        (_B + 1, [_B, 1]),
+        (2 * _B, [_B, _B]),
+    ],
+)
+def test_call_chunk_boundaries(patched_lazy_load, monkeypatch, n, expected_batches):
+    """Exact-multiple and off-by-one inputs produce no empty or oversized runs."""
+    assert _B == embedding._EMBEDDINGGEMMA_BATCH_SIZE, "update _B alongside the constant"
+    batch_sizes = []
+    original_encode_batch = _FakeTokenizer.encode_batch
+
+    def recording_encode_batch(self, texts):
+        batch_sizes.append(len(texts))
+        return original_encode_batch(self, texts)
+
+    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
+    ef = embedding.EmbeddinggemmaONNX()
+    out = ef([f"doc {i}" for i in range(n)])
+    assert batch_sizes == expected_batches
+    assert len(out) == n
+
+
+def test_custom_batch_size_is_honored(patched_lazy_load, monkeypatch):
+    """The constructor knob must drive the sub-batch split."""
+    batch_sizes = []
+    original_encode_batch = _FakeTokenizer.encode_batch
+
+    def recording_encode_batch(self, texts):
+        batch_sizes.append(len(texts))
+        return original_encode_batch(self, texts)
+
+    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
+    ef = embedding.EmbeddinggemmaONNX(batch_size=10)
+    out = ef([f"doc {i}" for i in range(24)])
+    assert batch_sizes == [10, 10, 4]
+    assert len(out) == 24
+
+
+def test_batch_size_below_one_is_rejected():
+    """A zero or negative batch size would loop forever or embed nothing."""
+    with pytest.raises(ValueError, match="batch_size"):
+        embedding.EmbeddinggemmaONNX(batch_size=0)
+    with pytest.raises(ValueError, match="batch_size"):
+        embedding.EmbeddinggemmaONNX(batch_size=-3)
+
+
+def test_call_empty_input_returns_empty(patched_lazy_load):
+    """Zero docs must yield zero embeddings, not a zero-row session.run."""
+    ef = embedding.EmbeddinggemmaONNX()
+    assert ef([]) == []
+
+
 def test_get_embedding_function_dispatches_to_embeddinggemma(monkeypatch):
     """model='embeddinggemma' must build EmbeddinggemmaONNX, not the MiniLM EF."""
     monkeypatch.setattr(

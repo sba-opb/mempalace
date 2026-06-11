@@ -135,6 +135,16 @@ _EMBEDDINGGEMMA_ONNX = "model_quantized.onnx"
 _EMBEDDINGGEMMA_PREFIX = "task: sentence similarity | query: "
 _EMBEDDINGGEMMA_DIM = 384  # Matryoshka truncation — first 384 dims of the 768
 _EMBEDDINGGEMMA_MAX_LEN = 2048
+# Default docs per session.run. The ONNX graph has no internal batching,
+# so one unchunked run over a repair-scale batch (5000 docs, repair.py/
+# cli.py) allocates attention buffers that grow with batch size and
+# superlinearly with padded length (score tensors are batch x heads x
+# len^2 per layer), and the kernel OOM-kills the process (#1770). 32
+# matches the internal batch size of chromadb's ONNXMiniLM_L6_V2, whose
+# chunked _forward survives the same call sites. embeddinggemma's
+# sentence_embedding output is attention-masked, so sub-batch padding
+# does not change any row's vector.
+_EMBEDDINGGEMMA_BATCH_SIZE = 32
 
 
 class EmbeddinggemmaONNX:
@@ -158,10 +168,13 @@ class EmbeddinggemmaONNX:
         # when switching models. Keep it stable.
         return "embeddinggemma_300m"
 
-    def __init__(self, preferred_providers=None):
+    def __init__(self, preferred_providers=None, batch_size: int = _EMBEDDINGGEMMA_BATCH_SIZE):
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self._providers = (
             list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
         )
+        self._batch_size = batch_size
         self._session = None
         self._tokenizer = None
         self._np = None
@@ -210,21 +223,29 @@ class EmbeddinggemmaONNX:
         self._tokenizer = tokenizer
         self._np = np
 
-    def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
+    def __call__(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
         self._lazy_load()
         np = self._np
-        texts = [_EMBEDDINGGEMMA_PREFIX + t for t in input]
-        encs = self._tokenizer.encode_batch(texts)
-        input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
-        attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
-        outputs = self._session.run(
-            None, {"input_ids": input_ids, "attention_mask": attention_mask}
-        )
-        sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
-        # L2-normalize so cosine similarity == dot product (matches what the
-        # MTEB methodology assumes; ChromaDB's distance is configured for it).
-        norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
-        return (sent_emb / norms).tolist()
+        embeddings: list[list[float]] = []
+        # Tokenize and run per sub-batch, not over the whole input: padding
+        # is to the longest sequence in the sub-batch, and the ONNX runtime
+        # only ever holds batch_size rows of attention buffers at a time
+        # (#1770).
+        for start in range(0, len(input), self._batch_size):
+            chunk = input[start : start + self._batch_size]
+            texts = [_EMBEDDINGGEMMA_PREFIX + t for t in chunk]
+            encs = self._tokenizer.encode_batch(texts)
+            input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+            attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
+            outputs = self._session.run(
+                None, {"input_ids": input_ids, "attention_mask": attention_mask}
+            )
+            sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
+            # L2-normalize so cosine similarity == dot product (matches what the
+            # MTEB methodology assumes; ChromaDB's distance is configured for it).
+            norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
+            embeddings.extend((sent_emb / norms).tolist())
+        return embeddings
 
     def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
         """Embed query documents (ChromaDB EF protocol)."""
