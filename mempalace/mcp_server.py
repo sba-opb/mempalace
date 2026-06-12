@@ -1613,7 +1613,7 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
         [(0, "")]
         if content == ""
         else [
-            (start, content[start:start + chunk_size])
+            (start, content[start : start + chunk_size])
             for start in range(0, len(content), chunk_size)
         ]
     )
@@ -1632,6 +1632,7 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
         chunk_metas.append(chunk_meta)
 
     return chunk_ids, chunk_docs, chunk_metas
+
 
 def tool_add_drawer(
     wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
@@ -1806,6 +1807,7 @@ def tool_delete_drawer(drawer_id: str):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
 
 def _capture_fd_stdout(fn):
     """Run ``fn()`` with its stdout captured at both the Python and fd level.
@@ -2066,6 +2068,7 @@ def tool_get_drawer(drawer_id: str):
     except Exception as e:
         return {"error": str(e)}
 
+
 def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
     """List logical drawers with pagination."""
     limit = max(1, min(limit, _MAX_RESULTS))
@@ -2097,7 +2100,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
         ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
-        page = drawers[offset:offset + limit]
+        page = drawers[offset : offset + limit]
 
         return {
             "drawers": page,
@@ -2108,6 +2111,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
     """Update an existing logical drawer's content and/or metadata."""
@@ -2215,6 +2219,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
 
 # ==================== KNOWLEDGE GRAPH ====================
 

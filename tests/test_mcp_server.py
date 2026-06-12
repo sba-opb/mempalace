@@ -1779,9 +1779,8 @@ def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
     assert "error" in missing
     assert "not found" in missing["error"].lower()
 
-def test_update_drawer_chunked_logical_id_rewrites_group(
-    monkeypatch, config, palace_path, kg
-):
+
+def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, palace_path, kg):
     """Updating the returned logical id rewrites the underlying chunk group."""
     _patch_mcp_server(monkeypatch, config, kg)
     _client, _col = _get_collection(palace_path, create=True)
@@ -1819,6 +1818,7 @@ def test_update_drawer_chunked_logical_id_rewrites_group(
     listed = tool_list_drawers(wing="new", room="new_room")
     assert listed["total"] == 1
     assert listed["drawers"][0]["drawer_id"] == logical_id
+
 
 # ── KG Tools ────────────────────────────────────────────────────────────
 
