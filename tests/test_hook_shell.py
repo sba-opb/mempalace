@@ -82,3 +82,45 @@ def test_count_human_messages_reads_utf8_transcripts_tolerantly(tmp_path):
     )
 
     assert result.stdout.strip() == "1"
+
+
+def test_parse_stop_cli_fails_loud_on_malformed_nonempty_stdin():
+    result = subprocess.run(
+        [sys.executable, "-m", "mempalace.hook_shell", "parse-stop"],
+        input="not-json garbage",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "__MEMPAL_PARSE_OK__" not in result.stdout
+    assert "traceback" in result.stderr.lower() or "json" in result.stderr.lower()
+
+
+def test_parse_precompact_cli_fails_loud_on_malformed_nonempty_stdin():
+    result = subprocess.run(
+        [sys.executable, "-m", "mempalace.hook_shell", "parse-precompact"],
+        input="not-json garbage",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "__MEMPAL_PARSE_OK__" not in result.stdout
+    assert "traceback" in result.stderr.lower() or "json" in result.stderr.lower()
+
+
+def test_parse_stop_cli_treats_empty_stdin_as_empty_payload():
+    result = subprocess.run(
+        [sys.executable, "-m", "mempalace.hook_shell", "parse-stop"],
+        input="",
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    lines = result.stdout.splitlines()
+    assert lines[:3] == ["__MEMPAL_PARSE_OK__", "unknown", "False"]
+    assert result.stderr == ""

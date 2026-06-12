@@ -95,11 +95,24 @@ def count_human_messages(path: str) -> int:
 
 
 def _load_stdin_json() -> dict:
-    try:
-        data = json.load(sys.stdin)
-    except Exception:
-        data = {}
-    return data if isinstance(data, dict) else {}
+    raw = sys.stdin.read()
+
+    # Empty stdin is a legitimate hook state. Treat it as an empty payload so
+    # the sentinel is printed and the shell fail-loud guard does not spam disk.
+    if raw == "":
+        return {}
+
+    # For non-empty malformed input, intentionally let json.loads raise.
+    # The shell hooks capture this stderr in last_python_err.log and, because
+    # no sentinel is printed, write a bounded copy of the raw payload to
+    # last_input.log. That fail-loud contract is pinned by
+    # tests/test_hooks_bash_compat.py.
+    data = json.loads(raw)
+
+    if not isinstance(data, dict):
+        raise TypeError(f"hook input must be a JSON object, got {type(data).__name__}")
+
+    return data
 
 
 def main(argv: list[str] | None = None) -> int:
