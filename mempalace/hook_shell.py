@@ -86,7 +86,7 @@ def count_human_messages(path: str) -> int:
                 continue
 
             content = msg.get("content", "")
-            if isinstance(content, str) and "<command-name>" in content:
+            if isinstance(content, str) and "<command-message>" in content:
                 continue
 
             count += 1

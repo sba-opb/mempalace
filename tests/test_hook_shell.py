@@ -66,6 +66,8 @@ def test_count_human_messages_reads_utf8_transcripts_tolerantly(tmp_path):
             ensure_ascii=False,
         )
         + "\n"
+        + json.dumps({"message": {"role": "user", "content": "ignore <command-message> message"}})
+        + "\n"
         + json.dumps({"message": {"role": "assistant", "content": "ignored"}})
         + "\n"
         + "{bad json\n",
