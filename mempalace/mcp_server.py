@@ -164,10 +164,10 @@ def _get_result_ids(result) -> list:
     if ids is not None:
         return ids
     if isinstance(result, dict):
-        return result.get("ids", [])
+        return result.get("ids") or []
     getter = getattr(result, "get", None)
     if callable(getter):
-        return getter("ids", [])
+        return getter("ids") or []
     return []
 
 
@@ -361,6 +361,7 @@ def _force_chroma_cache_reset() -> None:
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
+    cached_client = _client_cache
     _client_cache = None
     _collection_cache = None
     _collection_cache_backend = None
@@ -376,7 +377,24 @@ def _force_chroma_cache_reset() -> None:
         backend = get_backend_for_palace(_config.palace_path)
         backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
     except Exception:
-        pass
+        logger.debug("Failed to close cached Chroma backend during cache reset", exc_info=True)
+    if cached_client is not None:
+        try:
+            close = getattr(cached_client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug(
+                "Failed to close MCP-local Chroma client during cache reset", exc_info=True
+            )
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
+        if callable(clear_system_cache):
+            clear_system_cache()
+    except Exception:
+        logger.debug("Failed to clear Chroma shared system cache during cache reset", exc_info=True)
 
 
 # ── Vector-search disabled flag (#1222) ──────────────────────────────────
@@ -685,6 +703,16 @@ def _get_collection(create=False):
                     "details": "Could not open the selected backend collection.",
                     "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
                 }
+        return None
+
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not create and not os.path.isfile(db_path):
+        _force_chroma_cache_reset()
+        _collection_open_error = {
+            "error": "Chroma database missing",
+            "details": f"Could not open missing database at {db_path}.",
+            "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
+        }
         return None
 
     for attempt in range(2):

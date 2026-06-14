@@ -1239,6 +1239,16 @@ class TestWriteTools:
         assert result["reason"] == "already_exists"
         mock_col.upsert.assert_not_called()
 
+    def test_get_result_ids_normalizes_none_to_empty_list(self):
+        from mempalace import mcp_server
+
+        class DictLikeResult:
+            def get(self, key, default=None):
+                return None
+
+        assert mcp_server._get_result_ids({"ids": None}) == []
+        assert mcp_server._get_result_ids(DictLikeResult()) == []
+
     def test_add_drawer_fails_when_readback_misses(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -2385,10 +2395,20 @@ class TestCacheInvalidation:
         if os.path.isfile(db_file):
             os.remove(db_file)
 
+        make_client_calls = []
+
+        def fail_if_make_client_called(path):
+            make_client_calls.append(path)
+            raise AssertionError("_get_collection(create=False) should not open missing Chroma DB")
+
+        monkeypatch.setattr(mcp_server.ChromaBackend, "make_client", fail_if_make_client_called)
+
         # Cache should be invalidated; _get_collection returns None
         # because the backend can't open a missing DB without create=True
-        mcp_server._get_collection()
+        assert mcp_server._get_collection() is None
         # The key assertion: the old cached collection was dropped
+        assert make_client_calls == []
+        assert mcp_server._collection_cache is None
         assert mcp_server._palace_db_inode == 0
         assert mcp_server._palace_db_mtime == 0.0
 
