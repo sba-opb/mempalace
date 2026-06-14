@@ -4584,6 +4584,7 @@ def _serve_http(host: str, port: int) -> None:
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = 10
 
         def log_message(self, fmt, *args):
             logger.info("HTTP %s - " + fmt, self.client_address[0], *args)
@@ -4595,6 +4596,7 @@ def _serve_http(host: str, port: int) -> None:
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
+            self.close_connection = True
 
         def _send_json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -4630,12 +4632,11 @@ def _serve_http(host: str, port: int) -> None:
                 )
                 return
 
-            raw = self.rfile.read(content_length)
-
             try:
+                raw = self.rfile.read(content_length)
                 request = json.loads(raw.decode("utf-8"))
             except Exception as exc:
-                logger.warning("HTTP JSON-RPC parse error: %s", exc)
+                logger.warning("HTTP JSON-RPC read or parse error: %s", exc)
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
@@ -4731,8 +4732,13 @@ def _run_http_loop() -> None:
 
     raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
     if raw_warmup in _WARMUP_TRUTHY:
+
+        def _warmup_with_lock():
+            with _HTTP_REQUEST_LOCK:
+                _maybe_eager_warmup_embedder()
+
         threading.Thread(
-            target=_maybe_eager_warmup_embedder,
+            target=_warmup_with_lock,
             name="mcp-http-eager-warmup",
             daemon=True,
         ).start()
