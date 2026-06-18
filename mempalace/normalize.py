@@ -10,6 +10,7 @@ Supported:
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
     - Gemini CLI / Google AI Studio JSON sessions (contents / messages / flat list)
+    - Continue.dev session JSON (~/.continue/sessions/*.json)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -123,7 +124,7 @@ def normalize(filepath: str) -> str:
     if file_size > 500 * 1024 * 1024:  # 500 MB safety limit
         raise IOError(f"File too large ({file_size // (1024 * 1024)} MB): {filepath}")
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
             content = f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
@@ -168,7 +169,13 @@ def _try_normalize_json(content: str) -> Optional[str]:
     except json.JSONDecodeError:
         return None
 
-    for parser in (_try_gemini_json, _try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
+    for parser in (
+        _try_gemini_json,
+        _try_claude_ai_json,
+        _try_chatgpt_json,
+        _try_continue_json,
+        _try_slack_json,
+    ):
         normalized = parser(data)
         if normalized:
             return normalized
@@ -568,6 +575,61 @@ def _try_slack_json(data) -> Optional[str]:
     return None
 
 
+def _try_continue_json(data) -> Optional[str]:
+    """Continue.dev session JSON (~/.continue/sessions/*.json).
+
+    Sessions contain a ``history`` array of ``{role, content}`` message objects,
+    plus optional metadata (``title``, ``sessionId``, ``dateCreated``).
+    System messages are skipped.  Tool-call messages (role ``tool``) are
+    formatted inline when they contain text content.
+    """
+    if not isinstance(data, dict) or "history" not in data:
+        return None
+    history = data["history"]
+    if not isinstance(history, list):
+        return None
+
+    messages = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+        content = item.get("content", "")
+
+        # Extract text from string or list-of-blocks content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            text = "\n".join(p for p in parts if p).strip()
+        elif isinstance(content, str):
+            text = content.strip()
+        else:
+            continue
+
+        if not text:
+            continue
+
+        if role == "user":
+            messages.append(("user", text))
+        elif role == "assistant":
+            messages.append(("assistant", text))
+        elif role == "tool":
+            # Append tool output to the previous assistant turn if possible
+            if messages and messages[-1][0] == "assistant":
+                prev_role, prev_text = messages[-1]
+                messages[-1] = (prev_role, prev_text + "\n" + f"[tool] {text}")
+        # Skip system and other roles
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
+
+
 def _extract_content(content, tool_use_map: dict = None) -> str:
     """Pull text from content — handles str, list of blocks, or dict.
 
@@ -606,6 +668,8 @@ def _format_tool_use(block: dict) -> str:
     """Format a tool_use block into a human-readable one-liner."""
     name = block.get("name", "Unknown")
     inp = block.get("input", {})
+    if isinstance(inp, list):
+        inp = {}
 
     if name == "Bash":
         cmd = inp.get("command", "")
