@@ -233,6 +233,7 @@ _last_request_time: float = time.monotonic()
 # refuse before touching Chroma or the knowledge graph.
 _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
+_MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
@@ -266,7 +267,8 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     safe way to become the writer after the original holder exits.
     """
 
-    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_ERROR
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
+    global _MCP_WRITER_LOCK_ERROR
 
     if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
         return True, ""
@@ -276,6 +278,9 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
 
     if _MCP_WRITER_READ_ONLY:
         return False, _MCP_WRITER_LOCK_ERROR
+
+    if _MCP_WRITER_LOCK_FAILED:
+        return True, _MCP_WRITER_LOCK_ERROR
 
     try:
         from .palace import MineAlreadyRunning, mine_palace_lock
@@ -290,6 +295,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         )
         return False, _MCP_WRITER_LOCK_ERROR
     except Exception as exc:
+        _MCP_WRITER_LOCK_FAILED = True
         _MCP_WRITER_LOCK_ERROR = (
             "could not acquire MCP peer-writer lock for "
             f"{_config.palace_path!r}: {exc!r}; continuing without "
@@ -300,6 +306,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
 
     _MCP_WRITER_LOCK_CM = lock_cm
     _MCP_WRITER_READ_ONLY = False
+    _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
     return True, ""
 

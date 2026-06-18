@@ -3916,3 +3916,31 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     )
 
     assert '"ok": true' in response["result"]["content"][0]["text"]
+
+
+def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    calls = {"count": 0}
+
+    def broken_mine_palace_lock(palace_path):
+        calls["count"] += 1
+        raise RuntimeError(f"permission denied for {palace_path}")
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", broken_mine_palace_lock)
+
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
+    ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok_first is True
+    assert ok_second is True
+    assert calls["count"] == 1
+    assert mcp_server._MCP_WRITER_LOCK_FAILED is True
+    assert "continuing without peer-writer protection" in reason_first
+    assert reason_second == reason_first
