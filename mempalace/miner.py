@@ -47,6 +47,34 @@ from .ids import ID_RECIPE, make_drawer_id_from_chunk
 
 logger = logging.getLogger("mempalace_mcp")
 
+PHP_EXTENSIONS = {
+    # Compound Blade templates such as ``view.blade.php`` are covered by the
+    # final ``.php`` suffix.
+    ".php",
+    ".php3",
+    ".php4",
+    ".php5",
+    ".php7",
+    ".php8",
+    ".phtml",
+    ".phps",
+    ".phpt",
+    ".inc",
+    ".aw",
+    ".fcgi",
+    ".ctp",
+    ".module",
+    ".install",
+    ".profile",
+    ".theme",
+    ".engine",
+    ".twig",
+    ".blade",
+    ".tpl",
+    ".latte",
+    ".volt",
+}
+
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -69,7 +97,7 @@ READABLE_EXTENSIONS = {
     ".csv",
     ".sql",
     ".toml",
-}
+} | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
     "entities.json",

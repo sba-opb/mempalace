@@ -10,7 +10,15 @@ import pytest
 import yaml
 
 from mempalace.config import normalize_wing_name
-from mempalace.miner import detect_room, load_config, mine, scan_project, status
+from mempalace.miner import (
+    PHP_EXTENSIONS,
+    READABLE_EXTENSIONS,
+    detect_room,
+    load_config,
+    mine,
+    scan_project,
+    status,
+)
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
 
 
@@ -22,6 +30,24 @@ def write_file(path: Path, content: str):
 def scanned_files(project_root: Path, **kwargs):
     files = scan_project(str(project_root), **kwargs)
     return sorted(path.relative_to(project_root).as_posix() for path in files)
+
+
+def test_php_ecosystem_extensions_are_readable():
+    assert PHP_EXTENSIONS <= READABLE_EXTENSIONS
+
+
+def test_scan_project_includes_php_ecosystem_files(tmp_path):
+    expected = []
+    for index, extension in enumerate(sorted(PHP_EXTENSIONS)):
+        filename = f"example_{index}{extension}"
+        write_file(tmp_path / filename, "<?php echo 'verbatim';\n")
+        expected.append(filename)
+
+    # Extension matching is deliberately case-insensitive.
+    write_file(tmp_path / "uppercase.PHP", "<?php echo 'uppercase';\n")
+    expected.append("uppercase.PHP")
+
+    assert scanned_files(tmp_path) == sorted(expected)
 
 
 def test_project_mining():
