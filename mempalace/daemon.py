@@ -775,6 +775,15 @@ class DaemonClient:
         self.token = read_token(self.palace_path)
         self.host = endpoint.get("host") or HOST
         self.port = int(port)
+        # The daemon is always on 127.0.0.1, so a request must never go through
+        # an HTTP proxy. Building an opener with an empty ProxyHandler bypasses
+        # urllib's proxy discovery entirely. On macOS that discovery
+        # (urllib.request._scproxy, via the SystemConfiguration framework) runs
+        # on the first request to any host and is NOT bounded by the per-request
+        # timeout — on a CI runner with no network it can hang for tens of
+        # seconds, which looks exactly like the daemon never came up. A no-proxy
+        # opener is the correct production choice here and also removes that hang.
+        self._opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
 
     @property
     def base_url(self) -> str:
@@ -799,7 +808,7 @@ class DaemonClient:
             },
         )
         try:
-            with urlrequest.urlopen(req, timeout=timeout) as resp:
+            with self._opener.open(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8")
         except urlerror.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")

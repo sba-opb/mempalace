@@ -98,38 +98,14 @@ def test_queue_dedupes_and_recovers_running_jobs(tmp_path, monkeypatch):
 
 
 def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
-    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
-    palace = tmp_path / "palace"
-    palace.mkdir()
     calls = []
 
     def fake_execute(kind, payload):
         calls.append((kind, payload))
         return {"success": True, "exit_code": 0, "stdout": "done\n"}
 
-    monkeypatch.setattr(service, "execute_job", fake_execute)
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
 
-    thread = threading.Thread(
-        target=daemon.run_server,
-        kwargs={"palace_path": str(palace), "port": 0},
-        daemon=True,
-    )
-    thread.start()
-
-    client = None
-    # 30s: localhost bind is sub-second locally, but contended CI runners (notably
-    # the macOS GitHub Actions fleet) can take several seconds to bring the server
-    # up. A too-tight deadline here makes the test flake AND, because the server
-    # thread never shuts down on timeout, leaks env/umask into the rest of the
-    # suite (guarded by the _isolate_process_global_state fixture above).
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        client = daemon.get_client_if_running(str(palace))
-        if client is not None:
-            break
-        time.sleep(0.05)
-
-    assert client is not None
     health = client.health()
     assert health["ok"] is True
     assert health["palace_path"] == daemon.canonical_palace_path(str(palace))
@@ -141,9 +117,7 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     assert finished["result"]["stdout"] == "done\n"
     assert calls == [("mine", {"source": "src", "palace_path": str(palace.resolve())})]
 
-    client.shutdown()
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+    _stop_server(client, thread, holders)
 
 
 def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
@@ -194,11 +168,64 @@ def test_service_tool_classification():
 # --- helpers for HTTP-lifecycle tests ---
 
 
+def _capture_httpd(monkeypatch):
+    """Capture the httpd instance run_server creates.
+
+    run_server defines a local ``class _Server(ThreadingHTTPServer)``; by
+    monkeypatching ``daemon.ThreadingHTTPServer`` before run_server runs, that
+    subclass inherits from a capturing base that records each instance. The
+    httpd can then be force-stopped from the test thread (see _stop_server) so a
+    slow/failed ``client.shutdown()`` POST can never leave the server thread
+    alive — which on Windows hangs the interpreter at process exit on an open
+    listening socket.
+    """
+    holders: list = []
+    base = daemon.ThreadingHTTPServer
+
+    class _CapturingServer(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            holders.append(self)
+
+    monkeypatch.setattr(daemon, "ThreadingHTTPServer", _CapturingServer)
+    return holders
+
+
+def _stop_server(client, thread, holders, *, join_timeout=5.0):
+    """Shut the daemon down deterministically and assert the thread died.
+
+    First try the normal path (POST /shutdown). If the server thread is still
+    alive afterwards — the POST was slow, lost, or the drain overran the join —
+    call httpd.shutdown() directly from this thread (stdlib-safe: it is a
+    different thread than serve_forever) to force serve_forever to return, then
+    re-join. The assert turns a leak into a visible failure instead of a silent
+    interpreter-exit hang.
+    """
+    try:
+        client.shutdown()
+    except Exception:  # noqa: BLE001 - best-effort; we force-shutdown below
+        pass
+    thread.join(timeout=join_timeout)
+    if thread.is_alive() and holders:
+        httpd = holders[-1]
+        try:
+            httpd.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            httpd.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+        thread.join(timeout=join_timeout)
+    assert not thread.is_alive(), "daemon server thread did not shut down"
+
+
 def _start_server(tmp_path, monkeypatch, execute_fn):
     monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
     palace = tmp_path / "palace"
     palace.mkdir()
     monkeypatch.setattr(service, "execute_job", execute_fn)
+    holders = _capture_httpd(monkeypatch)
     thread = threading.Thread(
         target=daemon.run_server,
         kwargs={"palace_path": str(palace), "port": 0},
@@ -213,7 +240,7 @@ def _start_server(tmp_path, monkeypatch, execute_fn):
             break
         time.sleep(0.05)
     assert client is not None
-    return client, thread, palace
+    return client, thread, palace, holders
 
 
 # --- ship-blocker regressions ---
@@ -231,7 +258,7 @@ def test_systemexit_in_job_does_not_kill_worker(tmp_path, monkeypatch):
             raise SystemExit("boom")
         return {"success": True, "exit_code": 0}
 
-    client, thread, palace = _start_server(tmp_path, monkeypatch, fake_execute)
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
     try:
         first = client.submit("mine", {"source": "src"})
         finished_first = client.wait(first["id"], timeout=5)
@@ -244,9 +271,7 @@ def test_systemexit_in_job_does_not_kill_worker(tmp_path, monkeypatch):
         finished_second = client.wait(second["id"], timeout=5)
         assert finished_second["state"] == "succeeded"
     finally:
-        client.shutdown()
-        thread.join(timeout=5)
-    assert not thread.is_alive()
+        _stop_server(client, thread, holders)
 
 
 def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
@@ -267,7 +292,7 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
         return {"success": True, "exit_code": 0}
 
     monkeypatch.setattr(daemon, "SHUTDOWN_DRAIN_SECONDS", 0.2)
-    client, thread, palace = _start_server(tmp_path, monkeypatch, fake_execute)
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
     job = client.submit("mine", {"source": "src"}, dedupe_key="x")
     # Wait until the worker has claimed it (state flips to running).
     deadline = time.monotonic() + 5
@@ -277,9 +302,7 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
         time.sleep(0.02)
     assert client.get_job(job["id"])["state"] == "running"
 
-    client.shutdown()
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+    _stop_server(client, thread, holders)
 
     # The interrupted job must be cancelled (terminal), not left running.
     store = daemon.QueueStore(daemon.queue_path(str(palace)))
@@ -362,7 +385,9 @@ def test_health_rejects_missing_and_wrong_token(tmp_path, monkeypatch):
     from urllib import error as urlerror
     from urllib import request as urlrequest
 
-    client, thread, palace = _start_server(tmp_path, monkeypatch, lambda k, p: {"success": True})
+    client, thread, palace, holders = _start_server(
+        tmp_path, monkeypatch, lambda k, p: {"success": True}
+    )
     try:
         base = f"http://127.0.0.1:{client.port}"
         # No Authorization header → 401.
@@ -375,8 +400,7 @@ def test_health_rejects_missing_and_wrong_token(tmp_path, monkeypatch):
                 timeout=3,
             )
     finally:
-        client.shutdown()
-        thread.join(timeout=5)
+        _stop_server(client, thread, holders)
 
 
 def test_worker_overrides_client_palace_path(tmp_path, monkeypatch):
@@ -388,15 +412,14 @@ def test_worker_overrides_client_palace_path(tmp_path, monkeypatch):
         seen["palace_path"] = payload.get("palace_path")
         return {"success": True, "exit_code": 0}
 
-    client, thread, palace = _start_server(tmp_path, monkeypatch, fake_execute)
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
     try:
         job = client.submit(
             "mine", {"source": "src", "palace_path": "/tmp/other-palace"}, dedupe_key="p"
         )
         client.wait(job["id"], timeout=5)
     finally:
-        client.shutdown()
-        thread.join(timeout=5)
+        _stop_server(client, thread, holders)
     assert seen["palace_path"] == daemon.canonical_palace_path(str(palace))
     assert seen["palace_path"] != "/tmp/other-palace"
 
