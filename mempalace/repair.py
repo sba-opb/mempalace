@@ -43,6 +43,7 @@ from typing import Callable, Iterator, Optional
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
 from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .config import sqlite_read_uri
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -476,7 +477,7 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     try:
         import sqlite3
 
-        conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
         try:
             row = conn.execute(
                 """
@@ -516,7 +517,7 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
         return []
 
     try:
-        with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as conn:
+        with sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except sqlite3.Error as e:
         return [f"PRAGMA quick_check failed: {e}"]
@@ -1013,7 +1014,7 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     if not os.path.isfile(sqlite_path):
         return
 
-    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True)
     try:
         seg_row = conn.execute(
             """

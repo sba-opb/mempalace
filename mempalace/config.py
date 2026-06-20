@@ -205,6 +205,21 @@ DEFAULT_BACKEND = "chroma"
 DEFAULT_MAX_BACKUPS = 10
 
 
+def sqlite_read_uri(db_path: str) -> str:
+    """Return a read-only ``file:`` URI for ``sqlite3.connect(..., uri=True)``.
+
+    A bare ``f"file:{db_path}?mode=ro"`` mis-parses paths containing spaces or
+    other URI-reserved characters — common in real home directories (a Windows
+    user folder like ``First Last``, many macOS paths). ``pathname2url``
+    percent-encodes the path and normalizes separators so the database opens on
+    every platform.
+    """
+    from urllib.request import pathname2url
+
+    db_path = os.fspath(db_path)
+    return f"file:{pathname2url(db_path)}?mode=ro"
+
+
 @lru_cache(maxsize=1)
 def get_configured_collection_name() -> str:
     """Return the configured drawer collection name without repeated config-file reads."""

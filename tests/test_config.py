@@ -1,5 +1,6 @@
 import os
 import json
+import sqlite3
 import tempfile
 
 import pytest
@@ -10,6 +11,7 @@ from mempalace.config import (
     sanitize_iso_temporal,
     sanitize_kg_value,
     sanitize_name,
+    sqlite_read_uri,
 )
 
 
@@ -146,6 +148,31 @@ def test_embedding_threads_invalid_falls_back_to_auto(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMPALACE_EMBEDDING_THREADS", "not-a-number")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.embedding_threads == 2
+
+
+def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
+    """sqlite_read_uri must open a read-only DB whose path contains spaces,
+    which a bare f"file:{path}?mode=ro" mis-parses (especially on Windows)."""
+    db_dir = tmp_path / "palace with spaces"
+    db_dir.mkdir()
+    db_path = db_dir / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (42)")
+    setup.commit()
+    setup.close()
+
+    uri = sqlite_read_uri(str(db_path))
+    assert "%20" in uri  # the space is percent-encoded, not left raw
+
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+        # mode=ro is still honored through the encoded URI
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t VALUES (1)")
+    finally:
+        conn.close()
 
 
 def test_env_override():

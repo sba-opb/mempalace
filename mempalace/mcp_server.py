@@ -60,6 +60,7 @@ from .config import (  # noqa: E402
     sanitize_name,
     sanitize_content,
     sanitize_iso_temporal,
+    sqlite_read_uri,
     strip_lone_surrogates,
 )
 from .version import __version__  # noqa: E402
@@ -920,7 +921,7 @@ def _tool_status_via_sqlite() -> dict:
     rooms: dict = {}
     total = 0
     try:
-        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             row = conn.execute(
                 """

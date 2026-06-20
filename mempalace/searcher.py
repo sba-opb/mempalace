@@ -23,6 +23,7 @@ from .backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
+from .config import sqlite_read_uri
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -533,7 +534,7 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
         return {"error": f"sqlite open failed: {e}"}
 
