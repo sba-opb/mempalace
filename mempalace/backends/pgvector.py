@@ -80,6 +80,42 @@ def _json_dumps(obj: Any) -> str:
     return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _strip_nul(value: Any) -> Any:
+    """Recursively strip NUL (0x00) from strings, list/tuple items, and dict keys
+    and values so pgvector can store the result.
+
+    PostgreSQL cannot store NUL in ``text`` or ``jsonb``: psycopg rejects a raw
+    NUL in a text column ("PostgreSQL text fields cannot contain NUL (0x00)
+    bytes"), and a NUL in metadata serializes to a JSON unicode escape that the
+    ``jsonb`` cast rejects ("unsupported Unicode escape sequence"). A single
+    transcript that captured NUL in tool output would otherwise abort the whole
+    mine run (#1829). ChromaDB and the SQLite backend store the byte verbatim,
+    so stripping only here keeps the same inputs ingestible.
+
+    Applied to id, document, and metadata in :meth:`_PgVectorClient.upsert_rows`
+    so the write path never carries a NUL into Postgres. Only ``str`` values are
+    rewritten; the ``int``/``float``/``bool``/``None`` scalars JSON metadata
+    normalizes to pass through unchanged. Stripping is not injective, so two keys
+    (or ids)
+    differing only by a NUL collapse to one (last wins); this does not occur in
+    practice because drawer ids are SHA-256 hashes and metadata keys are fixed
+    field names, so only transcript-derived values are ever actually changed.
+    Unlike ``config.sanitize_content`` (which rejects NUL in user-supplied
+    content), the bulk-mine path strips so one stray byte cannot abort a whole
+    backfill. ``str.replace`` returns the original string when it holds no NUL,
+    so a clean document is not reallocated.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_strip_nul(key): _strip_nul(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(item) for item in value)
+    return value
+
+
 def _tokenize(text: str) -> list[str]:
     if not text:
         return []
@@ -581,9 +617,12 @@ class _PgVectorClient:
         )
         params = [
             (
-                row["id"],
-                row["document"],
-                _json_dumps(row.get("metadata")),
+                # Strip NUL from every text-bound field so none can abort the
+                # insert. ids are generated NUL-free hashes, so for real rows the
+                # id strip is a no-op (it never rewrites the ON CONFLICT key).
+                _strip_nul(row["id"]),
+                _strip_nul(row["document"]),
+                _json_dumps(_strip_nul(row.get("metadata"))),
                 _vector_literal(row["embedding"]),
                 row.get("updated_at") or _utcnow(),
             )

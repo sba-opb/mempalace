@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import threading
@@ -22,6 +23,7 @@ from mempalace.backends.pgvector import (
     _matches_where,
     _vector_distance,
     _as_vector_array,
+    _strip_nul,
 )
 
 
@@ -651,3 +653,99 @@ def test_client_execute_after_close_raises(monkeypatch):
     with pytest.raises(BackendError, match="closed"):
         client.ping()
     assert len(created) == 1
+
+
+def test_pgvector_upsert_strips_nul_bytes(monkeypatch):
+    """A NUL (0x00) byte in id/document/metadata must never reach Postgres.
+
+    psycopg's text/jsonb dumpers reject NUL outright ("PostgreSQL text fields
+    cannot contain NUL (0x00) bytes"), which aborts the entire mine run (#1829)
+    when a single transcript captured a NUL in tool output. ChromaDB and the
+    SQLite backend store the byte verbatim, so pgvector strips it to keep the
+    same inputs ingestible. Strip, not reject: rejecting would re-abort the
+    mine or drop the drawer entirely (recall loss).
+    """
+    captured = []
+
+    class _FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            return None
+
+        def executemany(self, sql, params=None):
+            captured.extend(params or [])
+
+        def fetchall(self):
+            return []
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    fake_psycopg = types.ModuleType("psycopg")
+    fake_psycopg.connect = lambda _dsn: _FakeConn()
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client.upsert_rows(
+        "drawers",
+        [
+            {
+                "id": "draw\x00er",
+                "document": "before\x00after",
+                "metadata": {"go\x00od": "v\x00w", "nested": ["a\x00b", 7]},
+                "embedding": [1.0, 0.0],
+                "updated_at": "2026-06-20T00:00:00Z",
+            }
+        ],
+    )
+
+    assert len(captured) == 1, "upsert_rows should bind exactly one row"
+    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
+
+    # No NUL survives into any text-bound parameter (id, document, metadata).
+    assert "\x00" not in row_id
+    assert "\x00" not in document
+    assert "\x00" not in metadata_json
+
+    # Stripping removes only the NUL; surrounding content is otherwise preserved.
+    assert row_id == "drawer"
+    assert document == "beforeafter"
+    assert json.loads(metadata_json) == {"good": "vw", "nested": ["ab", 7]}
+
+
+def test_strip_nul_helper():
+    """``_strip_nul`` removes NUL from strings, list/tuple items, and dict keys
+    and values; NUL-free input and non-string scalars are returned unchanged."""
+    assert _strip_nul("a\x00b") == "ab"
+    assert _strip_nul("clean") == "clean"
+    assert _strip_nul("") == ""
+    assert _strip_nul("\x00") == ""
+    # Keys, values, list items, and nested structures are all stripped.
+    assert _strip_nul({"k\x00": "v\x00", "n": [1, "x\x00y"]}) == {"k": "v", "n": [1, "xy"]}
+    assert _strip_nul([{"a\x00": "b\x00"}, "c\x00"]) == [{"a": "b"}, "c"]
+    # Tuples recurse too and stay tuples (defends direct callers that pass
+    # un-normalized metadata before the JSON round-trip).
+    assert _strip_nul(("a\x00b", 1, ["c\x00"])) == ("ab", 1, ["c"])
+    # Keys differing only by a NUL collapse, last wins (documented, harmless:
+    # real metadata keys are fixed field names, never NUL-only-distinguished).
+    assert _strip_nul({"a\x00": 1, "a": 2}) == {"a": 2}
+    # Non-string scalars pass through unchanged (bool stays bool, not int).
+    assert _strip_nul(7) == 7
+    assert _strip_nul(3.5) == 3.5
+    assert _strip_nul(True) is True
+    assert _strip_nul(None) is None
