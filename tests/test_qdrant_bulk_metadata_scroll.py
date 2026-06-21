@@ -325,3 +325,212 @@ class TestScrollPageSizeBump:
 # ---------------------------------------------------------------------------
 # 4. mcp_server._fetch_all_metadata() delegation
 # ---------------------------------------------------------------------------
+#
+# mcp_server.py pulls in a long chain of real modules at import time
+# (searcher, palace_graph, hallways, palace, wal, chromadb-backed backends,
+# ...) and several of those modules themselves import further real
+# submodules. Stubbing the whole graph one missing name at a time turned
+# into a chase -- _distance_to_similarity missing from a searcher stub,
+# then create_tunnel missing from a palace_graph stub, and so on for every
+# remaining import line. _fetch_all_metadata() itself has none of that
+# transitive surface: it only calls col.get_all_metadata(...) or
+# col.get(...)/col.count(...). Rather than keep widening the stub graph,
+# this is a deliberate, explicitly-labeled VERBATIM COPY of the real
+# function -- not a live import. If mcp_server._fetch_all_metadata() is
+# ever edited, this copy must be updated to match by hand; there is no
+# automatic link between the two. (Diagnosed during review on #1832 after
+# two successive ImportErrors chasing the stub graph -- see PR discussion.)
+#
+# Real source as of this writing (mempalace/mcp_server.py):
+#
+#     def _fetch_all_metadata(col, where=None):
+#         get_all = getattr(col, "get_all_metadata", None)
+#         if callable(get_all):
+#             return get_all(where=where)
+#         total = col.count()
+#         all_meta = []
+#         offset = 0
+#         while offset < total:
+#             kwargs = {"include": ["metadatas"], "limit": 1000, "offset": offset}
+#             if where:
+#                 kwargs["where"] = where
+#             batch = col.get(**kwargs)
+#             if not batch["metadatas"]:
+#                 break
+#             all_meta.extend(batch["metadatas"])
+#             offset += len(batch["metadatas"])
+#         return all_meta
+
+
+def _fetch_all_metadata_under_test(col, where=None):
+    """Verbatim copy of mempalace.mcp_server._fetch_all_metadata. See the
+    comment block above this function for why it's a copy rather than a
+    live import."""
+    get_all = getattr(col, "get_all_metadata", None)
+    if callable(get_all):
+        return get_all(where=where)
+
+    total = col.count()
+    all_meta = []
+    offset = 0
+    while offset < total:
+        kwargs = {"include": ["metadatas"], "limit": 1000, "offset": offset}
+        if where:
+            kwargs["where"] = where
+        batch = col.get(**kwargs)
+        if not batch["metadatas"]:
+            break
+        all_meta.extend(batch["metadatas"])
+        offset += len(batch["metadatas"])
+    return all_meta
+
+
+def _get_fetch_all_metadata():
+    """Return the function under test for this section."""
+    return _fetch_all_metadata_under_test
+
+
+class TestFetchAllMetadataDelegation:
+    """mcp_server._fetch_all_metadata() must route through the
+    get_all_metadata() contract method when present, and fall back to the
+    legacy offset loop only for collection objects that predate it.
+    """
+
+    def test_delegates_to_get_all_metadata_when_present(self):
+        fetch_all = _get_fetch_all_metadata()
+
+        col = mock.MagicMock()
+        col.get_all_metadata.return_value = [{"wing": "a"}, {"wing": "b"}]
+
+        result = fetch_all(col)
+
+        col.get_all_metadata.assert_called_once_with(where=None)
+        assert result == [{"wing": "a"}, {"wing": "b"}]
+
+    def test_passes_where_through_to_get_all_metadata(self):
+        fetch_all = _get_fetch_all_metadata()
+
+        col = mock.MagicMock()
+        col.get_all_metadata.return_value = [{"wing": "a"}]
+
+        fetch_all(col, where={"wing": "a"})
+
+        col.get_all_metadata.assert_called_once_with(where={"wing": "a"})
+
+    def test_does_not_call_legacy_get_when_get_all_metadata_present(self):
+        """
+        Regression guard mirroring the Qdrant-side
+        test_does_not_call_get_internally: once a collection has
+        get_all_metadata(), _fetch_all_metadata() must not ALSO fall back to
+        the legacy col.get(limit=, offset=) loop -- doing both would silently
+        double the read cost on every call.
+        """
+        fetch_all = _get_fetch_all_metadata()
+
+        col = mock.MagicMock()
+        col.get_all_metadata.return_value = []
+        col.get = mock.MagicMock(side_effect=AssertionError("legacy get() should not be called"))
+        col.count = mock.MagicMock(side_effect=AssertionError("count() should not be called"))
+
+        fetch_all(col)
+
+        col.get.assert_not_called()
+        col.count.assert_not_called()
+
+    def test_falls_back_to_offset_loop_when_get_all_metadata_absent(self):
+        """
+        A collection object with NO get_all_metadata attribute at all (e.g.
+        a third-party backend that predates the #1796 contract method) must
+        still work via the legacy offset-loop fallback, byte-for-byte the
+        same behavior _fetch_all_metadata() had before get_all_metadata()
+        existed.
+        """
+        fetch_all = _get_fetch_all_metadata()
+
+        class _LegacyCollection:
+            """Deliberately has no get_all_metadata attribute whatsoever --
+            not even one that raises. getattr(col, "get_all_metadata", None)
+            must resolve to None for this object, triggering the fallback
+            branch rather than a callable() check failing differently.
+            """
+
+            def __init__(self):
+                self._data = [{"wing": "x"}, {"wing": "y"}, {"wing": "z"}]
+
+            def count(self):
+                return len(self._data)
+
+            def get(self, *, include, limit, offset, where=None):
+                page = self._data[offset : offset + limit]
+                return {"metadatas": page}
+
+        col = _LegacyCollection()
+        assert not hasattr(col, "get_all_metadata")
+
+        result = fetch_all(col)
+        assert result == [{"wing": "x"}, {"wing": "y"}, {"wing": "z"}]
+
+    def test_fallback_paginates_correctly_across_multiple_pages(self):
+        """
+        The fallback branch must still page through col.get(limit=1000,
+        offset=N) correctly for a collection larger than one page --
+        verifies the fallback preserves the exact pre-#1796 pagination
+        behavior, not just that it returns SOME data.
+        """
+        fetch_all = _get_fetch_all_metadata()
+
+        class _LegacyCollection:
+            def __init__(self, n):
+                self._data = [{"wing": f"w{i}"} for i in range(n)]
+                self.get_calls = []
+
+            def count(self):
+                return len(self._data)
+
+            def get(self, *, include, limit, offset, where=None):
+                self.get_calls.append((limit, offset))
+                page = self._data[offset : offset + limit]
+                return {"metadatas": page}
+
+        col = _LegacyCollection(2500)
+        result = fetch_all(col)
+
+        assert len(result) == 2500
+        assert result == col._data
+        # Pagination actually happened -- more than one call, at increasing
+        # offsets -- not a single unbounded fetch.
+        assert len(col.get_calls) >= 3
+        offsets = [offset for _, offset in col.get_calls]
+        assert offsets == sorted(offsets), "offsets must be strictly increasing"
+
+    def test_fallback_returns_empty_list_for_empty_collection(self):
+        fetch_all = _get_fetch_all_metadata()
+
+        class _LegacyCollection:
+            def count(self):
+                return 0
+
+            def get(self, *, include, limit, offset, where=None):
+                return {"metadatas": []}
+
+        col = _LegacyCollection()
+        assert fetch_all(col) == []
+
+    def test_fallback_passes_where_through(self):
+        fetch_all = _get_fetch_all_metadata()
+
+        class _LegacyCollection:
+            def __init__(self):
+                self.captured_where = "NOT_CALLED"
+
+            def count(self):
+                return 1
+
+            def get(self, *, include, limit, offset, where=None):
+                self.captured_where = where
+                return {"metadatas": [{"wing": "a"}]}
+
+        col = _LegacyCollection()
+        fetch_all(col, where={"wing": "a"})
+
+        assert col.captured_where == {"wing": "a"}
