@@ -42,6 +42,7 @@ class _FakePgVectorClient:
     def __init__(self, _config):
         self.tables: dict = {}
         self.query_calls: list = []
+        self.scroll_calls: list = []
         _FakePgVectorClient.instances.append(self)
 
     def ping(self):
@@ -92,9 +93,18 @@ class _FakePgVectorClient:
             out.append(item)
         return out
 
-    def scroll_rows(self, table, *, where=None, with_embedding=False):
+    def scroll_rows(self, table, *, where=None, with_embedding=False, limit=None, offset=None):
+        self.scroll_calls.append({"where": where, "limit": limit, "offset": offset})
+        rows = self._filtered(table, where)
+        if limit is not None or offset:
+            # Mirror the real backend: ORDER BY id, then LIMIT/OFFSET.
+            rows = sorted(rows, key=lambda row: row["id"])
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
         out = []
-        for row in self._filtered(table, where):
+        for row in rows:
             out.append(
                 {
                     "id": row["id"],
@@ -363,6 +373,104 @@ def test_pgvector_get_limit_offset_and_embeddings(tmp_path, fake_pgvector):
     page = col.get(where={"wing": "x"}, limit=1, offset=1, include=["documents", "embeddings"])
     assert len(page.ids) == 1
     assert page.embeddings is not None and len(page.embeddings[0]) == 2
+
+
+def test_pgvector_get_unfiltered_page_pushes_limit_offset(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c", "d"],
+        documents=["da", "db", "dc", "dd"],
+        metadatas=[{"wing": "x"}, {"wing": "x"}, {"wing": "x"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get(limit=2, offset=1, include=["metadatas"])
+
+    # An unfiltered page is pushed to SQL as LIMIT/OFFSET instead of fetching
+    # the whole table and slicing in Python (the O(rows x pages) path).
+    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": 1}]
+    # ORDER BY id, then OFFSET 1 LIMIT 2 -> b, c.
+    assert page.ids == ["b", "c"]
+
+
+def test_pgvector_get_filtered_page_stays_on_full_scan(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["da", "db", "dc"],
+        metadatas=[{"wing": "x"}, {"wing": "y"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get(where={"wing": "x"}, limit=1, offset=1, include=["metadatas"])
+
+    # A filtered get keeps the full-scan path (no LIMIT/OFFSET pushed) so the
+    # exact _matches_where re-filter runs before pagination.
+    assert client.scroll_calls == [{"where": {"wing": "x"}, "limit": None, "offset": None}]
+    assert page.ids == ["c"]
+
+
+def test_pgvector_get_offset_only_and_limit_only_push(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c", "d"],
+        documents=["da", "db", "dc", "dd"],
+        metadatas=[{"wing": "x"}] * 4,
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8]],
+    )
+    client = fake_pgvector.instances[0]
+
+    # offset-only (limit=None) is pushed.
+    client.scroll_calls.clear()
+    page = col.get(offset=2, include=["metadatas"])
+    assert client.scroll_calls == [{"where": None, "limit": None, "offset": 2}]
+    assert page.ids == ["c", "d"]
+
+    # limit-only (offset=None) is pushed.
+    client.scroll_calls.clear()
+    page = col.get(limit=2, include=["metadatas"])
+    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": None}]
+    assert page.ids == ["a", "b"]
+
+
+def test_pgvector_get_negative_bounds_use_python_slice(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["da", "db", "dc"],
+        metadatas=[{"wing": "x"}] * 3,
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    # A negative offset must not reach SQL (OFFSET -1 would error); it falls
+    # through to the unchanged full-scan + Python-slice path.
+    page = col.get(offset=-1, include=["metadatas"])
+    assert client.scroll_calls == [{"where": None, "limit": None, "offset": None}]
+    assert page.ids == ["c"]
+
+
+def test_pgvector_get_pages_tile_without_overlap(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c", "d", "e"],
+        documents=["da", "db", "dc", "dd", "de"],
+        metadatas=[{"wing": "x"}] * 5,
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8], [0.3, 0.7]],
+    )
+    # Consecutive pages tile the whole table exactly once, in stable id order.
+    p1 = col.get(limit=2, offset=0, include=["metadatas"]).ids
+    p2 = col.get(limit=2, offset=2, include=["metadatas"]).ids
+    p3 = col.get(limit=2, offset=4, include=["metadatas"]).ids
+    assert p1 == ["a", "b"]
+    assert p2 == ["c", "d"]
+    assert p3 == ["e"]
+    assert p1 + p2 + p3 == ["a", "b", "c", "d", "e"]
 
 
 def test_pgvector_delete_by_where_pushdown_and_local(tmp_path, fake_pgvector):

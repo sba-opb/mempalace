@@ -674,6 +674,8 @@ class _PgVectorClient:
         *,
         where: Optional[dict] = None,
         with_embedding: bool = False,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
@@ -682,6 +684,18 @@ class _PgVectorClient:
         if with_embedding:
             cols += ", embedding"
         sql = f"SELECT {cols} FROM {qi} WHERE {where_sql}"
+        # Push pagination into SQL when a page is requested. ORDER BY the
+        # primary key gives OFFSET a stable order (an unordered scan may skip
+        # or repeat rows across pages); callers that scroll the whole table
+        # pass neither bound, leaving their SQL unchanged.
+        if limit is not None or offset:
+            sql += " ORDER BY id"
+            if limit is not None:
+                params.append(int(limit))
+                sql += " LIMIT %s"
+            if offset:
+                params.append(int(offset))
+                sql += " OFFSET %s"
         rows = self._execute(sql, params, fetch=True)
         return [
             self._row(record, with_embedding=with_embedding, with_distance=False)
@@ -841,13 +855,19 @@ class PgVectorCollection(BaseCollection):
                 )
             self._known_dimension = existing_dim or dimension
 
-    def _scroll(self, *, where=None, with_embedding=False) -> list[dict]:
+    def _scroll(self, *, where=None, with_embedding=False, limit=None, offset=None) -> list[dict]:
         self._ensure_open()
         if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return []
-        return self._client.scroll_rows(self._table, where=where, with_embedding=with_embedding)
+        return self._client.scroll_rows(
+            self._table,
+            where=where,
+            with_embedding=with_embedding,
+            limit=limit,
+            offset=offset,
+        )
 
     def _rows(
         self,
@@ -1066,16 +1086,40 @@ class PgVectorCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        rows = self._rows(
-            ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+        # Fast path for the common unfiltered page fetch (e.g.
+        # prefetch_mined_set's sweep): push LIMIT/OFFSET into the scan instead
+        # of fetching the whole table and slicing in Python, which is the
+        # O(rows x pages) cost this avoids. Only the no-filter case is pushed:
+        # the "metadata @> ..." pushdown is broader than the exact
+        # _matches_where re-filter for array/object values, so any filtered get
+        # keeps the full-scan path where that re-filter still runs. ids, where,
+        # where_document and negative bounds all fall through to the unchanged
+        # path below. (The document column is still selected for metadata-only
+        # pages; projecting it out needs the positional _row parser to change,
+        # so it stays a separate follow-up.)
+        push_page = (
+            ids is None
+            and not where
+            and not where_document
+            and (limit is None or limit >= 0)
+            and (offset is None or offset >= 0)
+            and (limit is not None or offset)
         )
-        if ids is not None:
-            by_id = {row["id"]: row for row in rows}
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
-        if offset:
-            rows = rows[offset:]
-        if limit is not None:
-            rows = rows[:limit]
+        if push_page:
+            rows = self._scroll(
+                where=None, with_embedding=spec.embeddings, limit=limit, offset=offset
+            )
+        else:
+            rows = self._rows(
+                ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+            )
+            if ids is not None:
+                by_id = {row["id"]: row for row in rows}
+                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
